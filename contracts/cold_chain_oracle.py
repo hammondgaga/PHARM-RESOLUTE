@@ -1,4 +1,4 @@
-# { "Depends": "py-genlayer:test" }
+#{ "Depends": "py-genlayer:test" }
 """
 PHARM RESOLUTE - Cold-Chain Integrity Oracle
 ----------------------------------------------
