@@ -1,7 +1,7 @@
 # { "Depends": "py-genlayer:test" }
 """
-Cold-Chain Integrity Oracle
-----------------------------
+PHARM RESOLUTE - Cold-Chain Integrity Oracle
+----------------------------------------------
 A GenLayer Intelligent Contract that resolves ambiguous cold-chain liability
 disputes for temperature-sensitive pharmaceutical shipments (vaccines,
 insulin, some antibiotics) moving through Nigeria's multi-hop distribution
@@ -19,41 +19,40 @@ contract cannot make on its own. This contract has GenLayer validators
 independently reason over the submitted evidence and reach consensus on a
 liability verdict and payout band, then (deterministically) executes payout
 against an on-chain escrow pool for the shipment.
-
-This is designed as a reusable primitive: any pharmacy, distributor, or
-adjacent perishable-goods supply chain (food, agro-inputs) can call
-`fund_escrow` + `submit_claim` + `release_payout` without needing to be
-built into this same app.
 """
 
 from genlayer import *
+from dataclasses import dataclass
 import json
 
 
+@allow_storage
+@dataclass
+class Claim:
+    shipment_id: str
+    pharmacy_name: str
+    carrier_name: str
+    distributor_name: str
+    liability: str
+    payout_band: u32
+    resolved: bool
+    paid_out: bool
+
+
 class ColdChainOracle(gl.Contract):
-    # claim_id (str) -> claim record (dict)
-    claims: dict
-    claim_counter: int
+    # claim_id (str) -> claim record
+    claims: TreeMap[str, Claim]
+    claim_counter: u32
     # shipment_id (str) -> escrowed GEN balance for that shipment
-    escrow_balance: dict
-    owner: str
+    escrow_balance: TreeMap[str, bigint]
+    owner: Address
 
     def __init__(self):
-        self.claims = {}
         self.claim_counter = 0
-        self.escrow_balance = {}
         self.owner = gl.message.sender_address
 
-    # ------------------------------------------------------------------
-    # Escrow funding (deterministic)
-    # ------------------------------------------------------------------
     @gl.public.write.payable
     def fund_escrow(self, shipment_id: str) -> None:
-        """
-        A distributor or carrier locks GEN value against a shipment_id
-        before dispatch. This pool is what a successful claim pays out
-        from.
-        """
         amount = gl.message.value
         current = self.escrow_balance.get(shipment_id, 0)
         self.escrow_balance[shipment_id] = current + amount
@@ -62,9 +61,6 @@ class ColdChainOracle(gl.Contract):
     def get_escrow_balance(self, shipment_id: str) -> int:
         return self.escrow_balance.get(shipment_id, 0)
 
-    # ------------------------------------------------------------------
-    # Claim submission and arbitration (non-deterministic, LLM consensus)
-    # ------------------------------------------------------------------
     @gl.public.write
     def submit_claim(
         self,
@@ -77,12 +73,6 @@ class ColdChainOracle(gl.Contract):
         packaging_condition: str,
         gps_deviation_notes: str,
     ) -> int:
-        """
-        Submits a cold-chain breach claim with free-text evidence.
-        Validators independently evaluate the same prompt and must reach
-        strict consensus on the liability category and payout band before
-        the claim is recorded as resolved.
-        """
         claim_id = self.claim_counter
         self.claim_counter += 1
 
@@ -115,11 +105,6 @@ Respond using ONLY this JSON format, with no other words or characters:
 
         def nondet():
             res = gl.nondet.exec_prompt(prompt, response_format="json")
-            # Only the fields validators must strictly agree on are
-            # included here. Free-text reasoning is intentionally excluded
-            # from the consensus payload since wording varies between
-            # validators; see README for how reasoning transparency could
-            # be added via a non-comparative equivalence check.
             return json.dumps(
                 {
                     "liability": res["liability"],
@@ -131,45 +116,60 @@ Respond using ONLY this JSON format, with no other words or characters:
         verdict_json = gl.eq_principle.strict_eq(nondet)
         verdict = json.loads(verdict_json)
 
-        self.claims[str(claim_id)] = {
-            "shipment_id": shipment_id,
-            "pharmacy_name": pharmacy_name,
-            "carrier_name": carrier_name,
-            "distributor_name": distributor_name,
-            "liability": verdict["liability"],
-            "payout_band": verdict["payout_band"],
-            "resolved": True,
-            "paid_out": False,
-        }
+        self.claims[str(claim_id)] = Claim(
+            shipment_id=shipment_id,
+            pharmacy_name=pharmacy_name,
+            carrier_name=carrier_name,
+            distributor_name=distributor_name,
+            liability=verdict["liability"],
+            payout_band=verdict["payout_band"],
+            resolved=True,
+            paid_out=False,
+        )
 
         return claim_id
 
+    def _claim_to_dict(self, c: Claim) -> dict:
+        return {
+            "shipment_id": c.shipment_id,
+            "pharmacy_name": c.pharmacy_name,
+            "carrier_name": c.carrier_name,
+            "distributor_name": c.distributor_name,
+            "liability": c.liability,
+            "payout_band": c.payout_band,
+            "resolved": c.resolved,
+            "paid_out": c.paid_out,
+        }
+
     @gl.public.view
     def get_claim(self, claim_id: int) -> dict:
-        return self.claims.get(str(claim_id), {})
+        c = self.claims.get(str(claim_id))
+        if c is None:
+            return {}
+        return self._claim_to_dict(c)
 
     @gl.public.view
     def get_all_claims(self) -> dict:
-        return self.claims
+        result = {}
+        for key, c in self.claims.items():
+            result[key] = self._claim_to_dict(c)
+        return result
 
-    # ------------------------------------------------------------------
-    # Payout execution (deterministic, gated on a resolved verdict)
-    # ------------------------------------------------------------------
     @gl.public.write
     def release_payout(self, claim_id: int, pharmacy_address: str) -> None:
         key = str(claim_id)
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
-        assert claim["resolved"], "claim not yet resolved"
-        assert not claim["paid_out"], "claim already paid out"
+        assert claim.resolved, "claim not yet resolved"
+        assert not claim.paid_out, "claim already paid out"
 
-        shipment_id = claim["shipment_id"]
+        shipment_id = claim.shipment_id
         pool = self.escrow_balance.get(shipment_id, 0)
-        payout = (pool * claim["payout_band"]) // 100
+        payout = (pool * claim.payout_band) // 100
 
         if payout > 0:
-            gl.emit_transfer(pharmacy_address, payout)
+            gl.emit_transfer(Address(pharmacy_address), payout)
             self.escrow_balance[shipment_id] = pool - payout
 
-        claim["paid_out"] = True
+        claim.paid_out = True
         self.claims[key] = claim
