@@ -156,20 +156,20 @@ Respond using ONLY this JSON format, with no other words or characters:
         return result
 
     @gl.public.write
-    def release_payout(self, claim_id: int, pharmacy_address: str) -> None:
-        key = str(claim_id)
-        claim = self.claims.get(key)
-        assert claim is not None, "claim does not exist"
-        assert claim.resolved, "claim not yet resolved"
-        assert not claim.paid_out, "claim already paid out"
+def release_payout(self, claim_id: int, pharmacy_address: str) -> None:
+    key = str(claim_id)
+    claim = self.claims.get(key)
+    assert claim is not None, "claim does not exist"
+    assert claim.resolved, "claim not yet resolved"
+    assert not claim.paid_out, "claim already paid out"
 
-        shipment_id = claim.shipment_id
-        pool = self.escrow_balance.get(shipment_id, 0)
-        payout = (pool * claim.payout_band) // 100
+    shipment_id = claim.shipment_id
+    pool = self.escrow_balance.get(shipment_id, 0)
+    payout = (pool * claim.payout_band) // 100
 
-        if payout > 0:
-            gl.emit_transfer(Address(pharmacy_address), payout)
-            self.escrow_balance[shipment_id] = pool - payout
+    if payout > 0:
+        gl.contract.get_at(Address(pharmacy_address)).emit_transfer(value=payout)
+        self.escrow_balance[shipment_id] = pool - payout
 
-        claim.paid_out = True
-        self.claims[key] = claim
+    claim.paid_out = True
+    self.claims[key] = claim
