@@ -47,7 +47,7 @@ export async function submitClaim(fields) {
     value: 0,
   });
 
-  return client.waitForTransactionReceipt({ hash: txHash });
+  return client.waitForTransactionReceipt({ hash: txHash, interval: 3000, retries: 40 });
 }
 
 export async function fundEscrow(shipmentId, amount) {
@@ -57,7 +57,7 @@ export async function fundEscrow(shipmentId, amount) {
     args: [shipmentId],
     value: amount,
   });
-  return client.waitForTransactionReceipt({ hash: txHash });
+  return client.waitForTransactionReceipt({ hash: txHash, interval: 3000, retries: 40 });
 }
 
 export async function releasePayout(claimId, pharmacyAddress) {
@@ -67,7 +67,7 @@ export async function releasePayout(claimId, pharmacyAddress) {
     args: [claimId, pharmacyAddress],
     value: 0,
   });
-  return client.waitForTransactionReceipt({ hash: txHash });
+  return client.waitForTransactionReceipt({ hash: txHash, interval: 3000, retries: 40 });
 }
 
 export async function getAllClaims() {
