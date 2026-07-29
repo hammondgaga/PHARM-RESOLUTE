@@ -168,8 +168,17 @@ Respond using ONLY this JSON format, with no other words or characters:
         payout = (pool * claim.payout_band) // 100
 
         if payout > 0:
-            gl.contract.get_at(Address(pharmacy_address)).emit_transfer(value=payout)
+            recipient = gl.ContractAt(Address(pharmacy_address))
+            recipient.emit_transfer(value=payout)
             self.escrow_balance[shipment_id] = pool - payout
 
-        claim.paid_out = True
-        self.claims[key] = claim
+        self.claims[key] = Claim(
+            shipment_id=claim.shipment_id,
+            pharmacy_name=claim.pharmacy_name,
+            carrier_name=claim.carrier_name,
+            distributor_name=claim.distributor_name,
+            liability=claim.liability,
+            payout_band=claim.payout_band,
+            resolved=claim.resolved,
+            paid_out=True,
+        )
