@@ -41,7 +41,43 @@ agro-inputs, vaccines for veterinary use) can call `fund_escrow` →
 `submit_claim` → `release_payout` against this same contract without being
 built into this frontend at all.
 
-## Architecture
+## Security model
+
+An earlier review round flagged that any caller could submit unverified
+evidence and redirect an approved payout to an arbitrary address. This
+version closes both issues, plus adds duplicate-claim protection:
+
+- **Role binding.** `register_shipment(shipment_id, carrier_address,
+  pharmacy_address)` must be called before anything else for a shipment.
+  It records the caller as the distributor and binds specific carrier and
+  pharmacy addresses to that `shipment_id`.
+- **Authenticated evidence.** `submit_claim` now asserts that
+  `gl.message.sender_address` matches the shipment's registered pharmacy
+  address. Since that address is the cryptographic signer of the
+  transaction, a claim is inherently tied to an authenticated,
+  pre-registered account rather than free text anyone could post.
+- **No arbitrary payout recipient.** `release_payout` no longer accepts a
+  recipient address as a parameter. Funds are always sent to the pharmacy
+  address recorded at registration time.
+- **One claim per shipment.** A `claimed` flag on the shipment record
+  blocks any further `submit_claim` calls for that `shipment_id` once one
+  claim has been filed.
+- **Contract-verified evidence.** `submit_claim` takes an `evidence_url`
+  (a photo of packaging/ice packs, or a page showing sensor logs).
+  Validators independently fetch that URL themselves via
+  `gl.nondet.web.render(url, mode="screenshot")` and visually inspect it
+  alongside the submitter's written narrative via
+  `gl.nondet.exec_prompt(images=[...])`. The contract itself retrieves
+  and reasons over the evidence — it isn't just trusting free text typed
+  by the claimant.
+
+**Known limitation / future work:** this verifies that the evidence image
+is consistent with the narrative, but doesn't cryptographically prove the
+photo was taken at the claimed time/place. A natural extension would have
+shipment sensors or the pharmacist's device sign evidence at capture time,
+with the contract checking that signature before accepting a claim.
+
+## Architecture (updated)
 
 ```
 contracts/cold_chain_oracle.py   Intelligent Contract (Python, GenLayer)
@@ -52,10 +88,11 @@ frontend/                        React claim-submission portal + dashboard
 
 | Method | Type | What it does |
 |---|---|---|
-| `fund_escrow(shipment_id)` | write, payable | Distributor/carrier locks GEN against a shipment before dispatch |
-| `submit_claim(...)` | write, non-deterministic | Validators independently reason over submitted evidence and reach strict consensus on `liability` (`carrier` / `distributor` / `force_majeure` / `no_breach`) and a `payout_band` (0/25/50/75/100%) |
-| `release_payout(claim_id, pharmacy_address)` | write, deterministic | Pays out the escrowed pool according to the resolved verdict |
-| `get_claim` / `get_all_claims` / `get_escrow_balance` | view | Read state |
+| `register_shipment(shipment_id, carrier_address, pharmacy_address)` | write | Caller becomes the distributor; binds carrier and pharmacy addresses to a shipment |
+| `fund_escrow(shipment_id)` | write, payable | Distributor or carrier locks GEN against a registered shipment |
+| `submit_claim(shipment_id, ..., evidence_url)` | write, non-deterministic | Only the registered pharmacy address may call this. Validators fetch `evidence_url` themselves and visually verify it alongside the narrative, then reach strict consensus on `liability` and a `payout_band`. Blocked after the shipment's first claim. |
+| `release_payout(claim_id)` | write, deterministic | Pays out the escrowed pool to the shipment's registered pharmacy address according to the resolved verdict — no caller-supplied recipient |
+| `get_shipment` / `get_claim` / `get_all_claims` / `get_escrow_balance` | view | Read state |
 
 The non-deterministic reasoning is isolated inside `submit_claim`, wrapped
 in `gl.eq_principle.strict_eq`, per GenLayer's pattern for LLM-backed

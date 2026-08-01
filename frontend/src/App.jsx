@@ -1,24 +1,31 @@
 import React, { useEffect, useState } from "react";
 import {
+  registerShipment,
+  fundEscrow,
   submitClaim,
   releasePayout,
   getAllClaims,
   CONTRACT_ADDRESS,
+  MY_ADDRESS,
 } from "./genlayerClient";
 
-const emptyForm = {
+const emptyClaimForm = {
   shipment_id: "",
-  pharmacy_name: "",
-  carrier_name: "",
-  distributor_name: "",
   last_known_temp_c: "",
   delay_narrative: "",
   packaging_condition: "",
   gps_deviation_notes: "",
+  evidence_url: "",
 };
 
 export default function App() {
-  const [form, setForm] = useState(emptyForm);
+  const [shipForm, setShipForm] = useState({
+    shipment_id: "",
+    carrier_address: "",
+    pharmacy_address: "",
+  });
+  const [fundForm, setFundForm] = useState({ shipment_id: "", amount: "" });
+  const [claimForm, setClaimForm] = useState(emptyClaimForm);
   const [claims, setClaims] = useState({});
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
@@ -37,19 +44,49 @@ export default function App() {
     refreshClaims();
   }, []);
 
-  function handleChange(e) {
-    setForm({ ...form, [e.target.name]: e.target.value });
+  async function handleRegisterShipment(e) {
+    e.preventDefault();
+    setStatus("Registering shipment...");
+    setLoading(true);
+    try {
+      await registerShipment(
+        shipForm.shipment_id,
+        shipForm.carrier_address,
+        shipForm.pharmacy_address
+      );
+      setStatus(`Shipment "${shipForm.shipment_id}" registered.`);
+    } catch (err) {
+      console.error(err);
+      setStatus("Registration failed: " + err.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
-  async function handleSubmit(e) {
+  async function handleFundEscrow(e) {
+    e.preventDefault();
+    setStatus("Funding escrow...");
+    setLoading(true);
+    try {
+      await fundEscrow(fundForm.shipment_id, Number(fundForm.amount));
+      setStatus(`Escrow funded for "${fundForm.shipment_id}".`);
+    } catch (err) {
+      console.error(err);
+      setStatus("Funding failed: " + err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSubmitClaim(e) {
     e.preventDefault();
     setStatus("Submitting claim to validators for consensus...");
     setLoading(true);
     try {
-      await submitClaim(form);
+      await submitClaim(claimForm);
       setStatus("Claim resolved. Refreshing list...");
       await refreshClaims();
-      setForm(emptyForm);
+      setClaimForm(emptyClaimForm);
     } catch (err) {
       console.error(err);
       setStatus("Submission failed: " + err.message);
@@ -59,14 +96,10 @@ export default function App() {
   }
 
   async function handleRelease(claimId) {
-    const pharmacyAddress = window.prompt(
-      "Pharmacy address to receive payout:"
-    );
-    if (!pharmacyAddress) return;
     setStatus(`Releasing payout for claim ${claimId}...`);
     try {
-      await releasePayout(claimId, pharmacyAddress);
-      setStatus("Payout released.");
+      await releasePayout(claimId);
+      setStatus("Payout released to the shipment's registered pharmacy.");
       await refreshClaims();
     } catch (err) {
       console.error(err);
@@ -78,7 +111,6 @@ export default function App() {
     <div className="page">
       <header>
         <h1>PHARM RESOLUTE</h1>
-        <p className="tagline">Cold-Chain Integrity Oracle</p>
         <p className="subtitle">
           A GenLayer Intelligent Contract that arbitrates cold-chain
           liability disputes for temperature-sensitive pharma shipments
@@ -90,84 +122,140 @@ export default function App() {
             ColdChainOracle contract address before submitting claims.
           </p>
         )}
+        {MY_ADDRESS && (
+          <p className="warning" style={{ background: "#0d2a1a", borderColor: "#1a7a3a", color: "#7affa0" }}>
+            Your session account: <code>{MY_ADDRESS}</code>
+            <br />
+            To test the full flow yourself, register a shipment using this
+            exact address as the pharmacy_address below - only this
+            account can then submit a claim or receive its payout.
+          </p>
+        )}
       </header>
 
       <section className="panel">
-        <h2>Submit a claim</h2>
-        <form onSubmit={handleSubmit} className="form-grid">
+        <h2>1. Register a shipment</h2>
+        <p className="hint">
+          Binds a carrier and pharmacy address to a shipment_id. Only the
+          registered pharmacy address may later file a claim or receive
+          its payout.
+        </p>
+        <form onSubmit={handleRegisterShipment} className="form-grid">
           <label>
             Shipment ID
             <input
-              name="shipment_id"
-              value={form.shipment_id}
-              onChange={handleChange}
+              value={shipForm.shipment_id}
+              onChange={(e) => setShipForm({ ...shipForm, shipment_id: e.target.value })}
               required
             />
           </label>
           <label>
-            Pharmacy name
+            Carrier address
             <input
-              name="pharmacy_name"
-              value={form.pharmacy_name}
-              onChange={handleChange}
+              value={shipForm.carrier_address}
+              onChange={(e) => setShipForm({ ...shipForm, carrier_address: e.target.value })}
+              placeholder="0x..."
+              required
+            />
+          </label>
+          <label className="full-width">
+            Pharmacy address
+            <input
+              value={shipForm.pharmacy_address}
+              onChange={(e) => setShipForm({ ...shipForm, pharmacy_address: e.target.value })}
+              placeholder="0x... (use your session account to test end-to-end)"
+              required
+            />
+          </label>
+          <button type="submit" disabled={loading}>
+            Register shipment
+          </button>
+        </form>
+      </section>
+
+      <section className="panel">
+        <h2>2. Fund escrow</h2>
+        <form onSubmit={handleFundEscrow} className="form-grid">
+          <label>
+            Shipment ID
+            <input
+              value={fundForm.shipment_id}
+              onChange={(e) => setFundForm({ ...fundForm, shipment_id: e.target.value })}
               required
             />
           </label>
           <label>
-            Carrier name
+            Amount (GEN, in wei)
             <input
-              name="carrier_name"
-              value={form.carrier_name}
-              onChange={handleChange}
+              value={fundForm.amount}
+              onChange={(e) => setFundForm({ ...fundForm, amount: e.target.value })}
+              placeholder="e.g. 10000000000000000000"
               required
             />
           </label>
+          <button type="submit" disabled={loading}>
+            Fund escrow
+          </button>
+        </form>
+      </section>
+
+      <section className="panel">
+        <h2>3. Submit a claim</h2>
+        <p className="hint">
+          Must be sent from the registered pharmacy account for this
+          shipment.
+        </p>
+        <form onSubmit={handleSubmitClaim} className="form-grid">
           <label>
-            Distributor name
+            Shipment ID
             <input
-              name="distributor_name"
-              value={form.distributor_name}
-              onChange={handleChange}
+              value={claimForm.shipment_id}
+              onChange={(e) => setClaimForm({ ...claimForm, shipment_id: e.target.value })}
               required
             />
           </label>
           <label>
             Last known temperature reading
             <input
-              name="last_known_temp_c"
-              placeholder="e.g. 9C recorded at 14:00 WAT, unknown after that"
-              value={form.last_known_temp_c}
-              onChange={handleChange}
+              value={claimForm.last_known_temp_c}
+              onChange={(e) => setClaimForm({ ...claimForm, last_known_temp_c: e.target.value })}
+              placeholder="e.g. 9C recorded at 14:00 WAT, unknown after"
               required
             />
           </label>
           <label className="full-width">
             Delay / transit narrative
             <textarea
-              name="delay_narrative"
-              placeholder="e.g. Vehicle held at checkpoint for 6 hours due to fuel scarcity, no cold pack replacement available"
-              value={form.delay_narrative}
-              onChange={handleChange}
+              value={claimForm.delay_narrative}
+              onChange={(e) => setClaimForm({ ...claimForm, delay_narrative: e.target.value })}
+              placeholder="e.g. Vehicle held at checkpoint for 6 hours due to fuel scarcity"
               required
             />
           </label>
           <label className="full-width">
             Packaging condition on arrival
             <textarea
-              name="packaging_condition"
-              placeholder="Pharmacist's note on ice pack state, box integrity, insulation condition"
-              value={form.packaging_condition}
-              onChange={handleChange}
+              value={claimForm.packaging_condition}
+              onChange={(e) => setClaimForm({ ...claimForm, packaging_condition: e.target.value })}
+              placeholder="Pharmacist's note on ice pack state, box integrity"
               required
             />
           </label>
           <label className="full-width">
             GPS / route deviation notes
             <textarea
-              name="gps_deviation_notes"
-              placeholder="Any recorded route deviation, or 'no GPS data available'"
-              value={form.gps_deviation_notes}
-              onChange={handleChange}
+              value={claimForm.gps_deviation_notes}
+              onChange={(e) => setClaimForm({ ...claimForm, gps_deviation_notes: e.target.value })}
+              placeholder="Any recorded deviation, or 'no GPS data available'"
+              required
+            />
+          </label>
+          <label className="full-width">
+            Evidence photo/document URL
+            <input
+              value={claimForm.evidence_url}
+              onChange={(e) => setClaimForm({ ...claimForm, evidence_url: e.target.value })}
+              placeholder="Link to a photo of packaging/ice packs, or a page showing sensor logs - validators fetch and visually verify this"
               required
             />
           </label>

@@ -7,18 +7,32 @@ disputes for temperature-sensitive pharmaceutical shipments (vaccines,
 insulin, some antibiotics) moving through Nigeria's multi-hop distribution
 networks (distributor -> carrier/dispatch -> pharmacy).
 
-When a pharmacy receives a shipment it believes was compromised in transit,
-there is rarely a clean, complete sensor log. Evidence is a mix of partial
-temperature readings, a driver/carrier narrative (fuel scarcity, checkpoint
-delays, vehicle breakdown, diversion), the receiving pharmacist's
-professional assessment of packaging condition, and route/GPS notes.
+SECURITY MODEL
+--------------
+A shipment must be registered by its distributor before any claim can be
+filed against it. Registration binds three addresses to a shipment_id:
+distributor, carrier, and pharmacy. This closes two issues from an earlier
+review round:
 
-Deciding whether the carrier, the distributor, or nobody (force majeure) is
-liable is exactly the kind of natural-language judgment call a deterministic
-contract cannot make on its own. This contract has GenLayer validators
-independently reason over the submitted evidence and reach consensus on a
-liability verdict and payout band, then (deterministically) executes payout
-against an on-chain escrow pool for the shipment.
+  1. Unauthenticated evidence: only the address registered as the
+     shipment's pharmacy may call submit_claim for that shipment. Since
+     gl.message.sender_address reflects the cryptographic signer of the
+     transaction, a claim is inherently "signed" by an authenticated,
+     pre-registered account rather than free text anyone could post.
+  2. Arbitrary payout address: release_payout no longer accepts a
+     recipient address as a parameter at all. Funds are always sent to
+     the pharmacy address recorded at registration time.
+
+A `claimed` flag on the shipment record also prevents the same shipment
+from being claimed more than once.
+
+Evidence verification: submit_claim accepts an evidence_url. Validators
+independently fetch that URL themselves via gl.nondet.web.render(...,
+mode="screenshot") and visually inspect it alongside the submitter's
+written narrative via gl.nondet.exec_prompt(images=[...]), rather than
+trusting free text alone. This is genuinely contract-verifiable: the
+contract itself retrieves and reasons over the evidence, not the
+claimant.
 """
 
 from genlayer import *
@@ -28,51 +42,126 @@ import json
 
 @allow_storage
 @dataclass
+class Shipment:
+    distributor: Address
+    carrier: Address
+    pharmacy: Address
+    escrow_balance: bigint
+    claimed: bool
+
+
+@allow_storage
+@dataclass
 class Claim:
     shipment_id: str
-    pharmacy_name: str
-    carrier_name: str
-    distributor_name: str
     liability: str
     payout_band: u32
+    submitted_by: Address
+    evidence_url: str
     resolved: bool
     paid_out: bool
 
 
 class ColdChainOracle(gl.Contract):
+    # shipment_id (str) -> registered shipment record
+    shipments: TreeMap[str, Shipment]
     # claim_id (str) -> claim record
     claims: TreeMap[str, Claim]
     claim_counter: u32
-    # shipment_id (str) -> escrowed GEN balance for that shipment
-    escrow_balance: TreeMap[str, bigint]
-    owner: Address
 
     def __init__(self):
         self.claim_counter = 0
-        self.owner = gl.message.sender_address
 
+    # ------------------------------------------------------------------
+    # Shipment registration (binds authenticated roles to a shipment)
+    # ------------------------------------------------------------------
+    @gl.public.write
+    def register_shipment(
+        self, shipment_id: str, carrier_address: str, pharmacy_address: str
+    ) -> None:
+        """
+        Registers a shipment before dispatch. The caller becomes the
+        distributor of record. carrier_address and pharmacy_address are
+        bound to this shipment_id - only the registered pharmacy address
+        will be able to file a claim or receive a payout for it.
+        """
+        assert shipment_id not in self.shipments, "shipment already registered"
+        self.shipments[shipment_id] = Shipment(
+            distributor=gl.message.sender_address,
+            carrier=Address(carrier_address),
+            pharmacy=Address(pharmacy_address),
+            escrow_balance=0,
+            claimed=False,
+        )
+
+    @gl.public.view
+    def get_shipment(self, shipment_id: str) -> dict:
+        s = self.shipments.get(shipment_id)
+        if s is None:
+            return {}
+        return {
+            "distributor": s.distributor.as_hex,
+            "carrier": s.carrier.as_hex,
+            "pharmacy": s.pharmacy.as_hex,
+            "escrow_balance": s.escrow_balance,
+            "claimed": s.claimed,
+        }
+
+    # ------------------------------------------------------------------
+    # Escrow funding (deterministic, restricted to distributor or carrier)
+    # ------------------------------------------------------------------
     @gl.public.write.payable
     def fund_escrow(self, shipment_id: str) -> None:
+        shipment = self.shipments.get(shipment_id)
+        assert shipment is not None, "shipment not registered"
+        sender = gl.message.sender_address
+        assert (
+            sender == shipment.distributor or sender == shipment.carrier
+        ), "only the distributor or carrier may fund escrow"
+
         amount = gl.message.value
-        current = self.escrow_balance.get(shipment_id, 0)
-        self.escrow_balance[shipment_id] = current + amount
+        self.shipments[shipment_id] = Shipment(
+            distributor=shipment.distributor,
+            carrier=shipment.carrier,
+            pharmacy=shipment.pharmacy,
+            escrow_balance=shipment.escrow_balance + amount,
+            claimed=shipment.claimed,
+        )
 
     @gl.public.view
     def get_escrow_balance(self, shipment_id: str) -> int:
-        return self.escrow_balance.get(shipment_id, 0)
+        s = self.shipments.get(shipment_id)
+        return s.escrow_balance if s is not None else 0
 
+    # ------------------------------------------------------------------
+    # Claim submission and arbitration (non-deterministic, LLM consensus)
+    # ------------------------------------------------------------------
     @gl.public.write
     def submit_claim(
         self,
         shipment_id: str,
-        pharmacy_name: str,
-        carrier_name: str,
-        distributor_name: str,
         last_known_temp_c: str,
         delay_narrative: str,
         packaging_condition: str,
         gps_deviation_notes: str,
+        evidence_url: str,
     ) -> int:
+        """
+        Submits a cold-chain breach claim. evidence_url should point to a
+        photo of the shipment's packaging/ice packs on arrival (or a
+        screenshot-able page showing sensor/log data). Validators
+        independently fetch this URL themselves via gl.nondet.web.render
+        and visually verify it against the submitted narrative, rather
+        than trusting the pharmacist's text description alone. Only
+        callable by the address registered as this shipment's pharmacy.
+        Only one claim may ever be filed per shipment.
+        """
+        shipment = self.shipments.get(shipment_id)
+        assert shipment is not None, "shipment not registered"
+        sender = gl.message.sender_address
+        assert sender == shipment.pharmacy, "only the registered pharmacy may file a claim"
+        assert not shipment.claimed, "a claim has already been filed for this shipment"
+
         claim_id = self.claim_counter
         self.claim_counter += 1
 
@@ -81,7 +170,12 @@ You are an impartial cold-chain logistics arbitrator for pharmaceutical
 shipments distributed across Nigeria.
 
 Review the evidence below for a temperature-sensitive shipment dispute and
-decide who bears liability for a possible cold-chain breach.
+decide who bears liability for a possible cold-chain breach. You have
+also been given a photo/screenshot of the evidence referenced by the
+claimant. Weigh what you can actually observe in the image against the
+written narrative below - if the image contradicts the narrative (for
+example, packaging looks intact despite a claim of melted ice packs),
+factor that into your liability decision.
 
 SHIPMENT ID: {shipment_id}
 LAST KNOWN TEMPERATURE READING: {last_known_temp_c}
@@ -104,7 +198,15 @@ Respond using ONLY this JSON format, with no other words or characters:
 """
 
         def nondet():
-            res = gl.nondet.exec_prompt(prompt, response_format="json")
+            if evidence_url:
+                evidence_image = gl.nondet.web.render(evidence_url, mode="screenshot")
+                res = gl.nondet.exec_prompt(
+                    prompt,
+                    images=[evidence_image],
+                    response_format="json",
+                )
+            else:
+                res = gl.nondet.exec_prompt(prompt, response_format="json")
             return json.dumps(
                 {
                     "liability": res["liability"],
@@ -118,13 +220,21 @@ Respond using ONLY this JSON format, with no other words or characters:
 
         self.claims[str(claim_id)] = Claim(
             shipment_id=shipment_id,
-            pharmacy_name=pharmacy_name,
-            carrier_name=carrier_name,
-            distributor_name=distributor_name,
             liability=verdict["liability"],
             payout_band=verdict["payout_band"],
+            submitted_by=sender,
+            evidence_url=evidence_url,
             resolved=True,
             paid_out=False,
+        )
+
+        # Lock the shipment so it cannot be claimed again.
+        self.shipments[shipment_id] = Shipment(
+            distributor=shipment.distributor,
+            carrier=shipment.carrier,
+            pharmacy=shipment.pharmacy,
+            escrow_balance=shipment.escrow_balance,
+            claimed=True,
         )
 
         return claim_id
@@ -132,11 +242,10 @@ Respond using ONLY this JSON format, with no other words or characters:
     def _claim_to_dict(self, c: Claim) -> dict:
         return {
             "shipment_id": c.shipment_id,
-            "pharmacy_name": c.pharmacy_name,
-            "carrier_name": c.carrier_name,
-            "distributor_name": c.distributor_name,
             "liability": c.liability,
             "payout_band": c.payout_band,
+            "submitted_by": c.submitted_by.as_hex,
+            "evidence_url": c.evidence_url,
             "resolved": c.resolved,
             "paid_out": c.paid_out,
         }
@@ -155,30 +264,42 @@ Respond using ONLY this JSON format, with no other words or characters:
             result[key] = self._claim_to_dict(c)
         return result
 
+    # ------------------------------------------------------------------
+    # Payout execution (deterministic; recipient is always the shipment's
+    # registered pharmacy address, never a caller-supplied one)
+    # ------------------------------------------------------------------
     @gl.public.write
-    def release_payout(self, claim_id: int, pharmacy_address: str) -> None:
+    def release_payout(self, claim_id: int) -> None:
         key = str(claim_id)
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
         assert claim.resolved, "claim not yet resolved"
         assert not claim.paid_out, "claim already paid out"
 
-        shipment_id = claim.shipment_id
-        pool = self.escrow_balance.get(shipment_id, 0)
+        shipment = self.shipments.get(claim.shipment_id)
+        assert shipment is not None, "shipment not found"
+
+        pool = shipment.escrow_balance
         payout = (pool * claim.payout_band) // 100
 
         if payout > 0:
-            recipient = gl.get_contract_at(Address(pharmacy_address))
+            recipient = gl.get_contract_at(shipment.pharmacy)
             recipient.emit_transfer(value=payout)
-            self.escrow_balance[shipment_id] = pool - payout
+
+            self.shipments[claim.shipment_id] = Shipment(
+                distributor=shipment.distributor,
+                carrier=shipment.carrier,
+                pharmacy=shipment.pharmacy,
+                escrow_balance=pool - payout,
+                claimed=shipment.claimed,
+            )
 
         self.claims[key] = Claim(
             shipment_id=claim.shipment_id,
-            pharmacy_name=claim.pharmacy_name,
-            carrier_name=claim.carrier_name,
-            distributor_name=claim.distributor_name,
             liability=claim.liability,
             payout_band=claim.payout_band,
+            submitted_by=claim.submitted_by,
+            evidence_url=claim.evidence_url,
             resolved=claim.resolved,
             paid_out=True,
         )
