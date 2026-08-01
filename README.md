@@ -41,41 +41,51 @@ agro-inputs, vaccines for veterinary use) can call `fund_escrow` →
 `submit_claim` → `release_payout` against this same contract without being
 built into this frontend at all.
 
-## Security model
+## Dispute model (two-sided)
 
 An earlier review round flagged that any caller could submit unverified
-evidence and redirect an approved payout to an arbitrary address. This
-version closes both issues, plus adds duplicate-claim protection:
+evidence and redirect an approved payout to an arbitrary address - and
+separately, the original design only let the pharmacy speak, with no way
+for the carrier to defend themselves. This version addresses both:
 
-- **Role binding.** `register_shipment(shipment_id, carrier_address,
-  pharmacy_address)` must be called before anything else for a shipment.
-  It records the caller as the distributor and binds specific carrier and
-  pharmacy addresses to that `shipment_id`.
-- **Authenticated evidence.** `submit_claim` now asserts that
-  `gl.message.sender_address` matches the shipment's registered pharmacy
-  address. Since that address is the cryptographic signer of the
-  transaction, a claim is inherently tied to an authenticated,
-  pre-registered account rather than free text anyone could post.
-- **No arbitrary payout recipient.** `release_payout` no longer accepts a
-  recipient address as a parameter. Funds are always sent to the pharmacy
-  address recorded at registration time.
-- **One claim per shipment.** A `claimed` flag on the shipment record
-  blocks any further `submit_claim` calls for that `shipment_id` once one
-  claim has been filed.
-- **Contract-verified evidence.** `submit_claim` takes an `evidence_url`
-  (a photo of packaging/ice packs, or a page showing sensor logs).
-  Validators independently fetch that URL themselves via
-  `gl.nondet.web.render(url, mode="screenshot")` and visually inspect it
-  alongside the submitter's written narrative via
-  `gl.nondet.exec_prompt(images=[...])`. The contract itself retrieves
-  and reasons over the evidence — it isn't just trusting free text typed
-  by the claimant.
+1. **`register_shipment`** - the distributor binds a specific carrier and
+   pharmacy address to a `shipment_id` before anything else happens.
+2. **`fund_escrow`** - distributor or carrier locks GEN against the
+   shipment.
+3. **`submit_claim`** - only the *registered pharmacy address* may file a
+   claim, with a narrative and an `evidence_url` (a photo of packaging/ice
+   packs). This does **not** immediately produce a verdict.
+4. **`submit_defense`** *(optional, once)* - only the *registered carrier
+   address* may respond, with their own narrative and evidence URL (e.g.
+   photos showing the shipment was properly insulated).
+5. **`resolve_claim`** - callable by anyone once a claim exists. Validators
+   independently fetch *both* parties' evidence URLs themselves via
+   `gl.nondet.web.render(url, mode="screenshot")` and weigh both images
+   against both narratives via `gl.nondet.exec_prompt(images=[...])`,
+   then reach strict consensus on `liability` and a `payout_band`. If the
+   carrier never filed a defense, the arbitrator is told that explicitly
+   rather than silently assuming guilt.
+6. **`release_payout`** - pays the resolved verdict's share of escrow to
+   the shipment's *registered* pharmacy address. No caller-supplied
+   recipient parameter exists anymore - this closes the arbitrary-payout
+   vulnerability directly.
 
-**Known limitation / future work:** this verifies that the evidence image
-is consistent with the narrative, but doesn't cryptographically prove the
-photo was taken at the claimed time/place. A natural extension would have
-shipment sensors or the pharmacist's device sign evidence at capture time,
-with the contract checking that signature before accepting a claim.
+Additional protections: a `claimed` flag blocks a second claim on the
+same shipment, and both `submit_claim`/`submit_defense` assert
+`gl.message.sender_address` matches the registered role - since that
+address is the cryptographic signer of the transaction, evidence is
+inherently tied to an authenticated account rather than free text anyone
+could post.
+
+**Known limitations / future work:**
+- There's no on-chain deadline forcing a minimum response window before
+  `resolve_claim` can be called - anyone can call it immediately, whether
+  or not the carrier has responded. A production version would add a
+  block-height-based deadline giving the carrier a guaranteed window.
+- Evidence *images* are visually verified, but the contract doesn't
+  cryptographically prove a photo was taken at the claimed time/place. A
+  natural extension would have shipment sensors or a device sign evidence
+  at capture time, with the contract checking that signature.
 
 ## Architecture (updated)
 
@@ -88,10 +98,12 @@ frontend/                        React claim-submission portal + dashboard
 
 | Method | Type | What it does |
 |---|---|---|
-| `register_shipment(shipment_id, carrier_address, pharmacy_address)` | write | Caller becomes the distributor; binds carrier and pharmacy addresses to a shipment |
+| `register_shipment(shipment_id, carrier_address, pharmacy_address)` | write | Caller becomes the distributor; binds carrier and pharmacy addresses |
 | `fund_escrow(shipment_id)` | write, payable | Distributor or carrier locks GEN against a registered shipment |
-| `submit_claim(shipment_id, ..., evidence_url)` | write, non-deterministic | Only the registered pharmacy address may call this. Validators fetch `evidence_url` themselves and visually verify it alongside the narrative, then reach strict consensus on `liability` and a `payout_band`. Blocked after the shipment's first claim. |
-| `release_payout(claim_id)` | write, deterministic | Pays out the escrowed pool to the shipment's registered pharmacy address according to the resolved verdict — no caller-supplied recipient |
+| `submit_claim(shipment_id, ..., evidence_url)` | write | Only the registered pharmacy may call this. Files a claim - no verdict yet. |
+| `submit_defense(claim_id, defense_narrative, defense_evidence_url)` | write | Only the registered carrier may call this, once, before resolution |
+| `resolve_claim(claim_id)` | write, non-deterministic | Callable by anyone. Validators fetch both parties' evidence URLs and reach strict consensus on `liability` and `payout_band`. |
+| `release_payout(claim_id)` | write, deterministic | Pays out to the shipment's registered pharmacy address — no caller-supplied recipient |
 | `get_shipment` / `get_claim` / `get_all_claims` / `get_escrow_balance` | view | Read state |
 
 The non-deterministic reasoning is isolated inside `submit_claim`, wrapped
@@ -135,17 +147,23 @@ CLI (`genlayer deploy`).
 
 ## Use case walkthrough
 
-1. A distributor dispatching insulin from Lagos to a pharmacy in Onitsha
-   locks GEN into escrow for `shipment_id="SHP-2201"` via `fund_escrow`.
-2. The shipment arrives; the receiving pharmacist believes the cold chain
-   was broken and submits a claim with what evidence exists: last known
-   temperature, the driver's delay account, packaging condition, and
-   route notes.
-3. Validators independently run the arbitration prompt against that
-   evidence and reach consensus: e.g. `liability: "carrier"`,
-   `payout_band: 75`.
-4. `release_payout` pays 75% of the escrowed pool to the pharmacy's
-   address, deterministically, based on the agreed verdict.
+1. A distributor registers a shipment (`SHP-2201`), binding a specific
+   carrier address and pharmacy address to it.
+2. The distributor (or carrier) locks GEN into escrow for that shipment.
+3. The shipment arrives; the registered pharmacy believes the cold chain
+   was broken and files a claim: last known temperature, delay account,
+   packaging condition, and a photo of the melted ice packs. No verdict
+   yet.
+4. The registered carrier has a chance to respond with a defense - e.g.
+   a narrative explaining the delay was unavoidable, plus a photo showing
+   the shipment was properly insulated at dispatch.
+5. Either party (or anyone) calls `resolve_claim`. Validators
+   independently fetch both evidence photos and weigh them against both
+   narratives, then reach consensus: e.g. `liability: "carrier"`,
+   `payout_band: 75` (partial liability, since the carrier's defense
+   photo held up better than their narrative claimed).
+6. `release_payout` pays 75% of the escrowed pool to the pharmacy's
+   registered address, deterministically, based on the agreed verdict.
 
 ## License
 
