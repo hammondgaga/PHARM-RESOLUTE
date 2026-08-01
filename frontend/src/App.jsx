@@ -184,8 +184,8 @@ export default function App() {
       </section>
 
       <section className="panel">
-        <h2>4. Carrier: submit a defense (optional)</h2>
-        <p className="hint">Must be sent from the registered carrier account, before the claim is resolved.</p>
+        <h2>4. Carrier: submit a defense (required before resolution)</h2>
+        <p className="hint">Must be sent from the registered carrier account. A claim cannot be resolved until this has been filed.</p>
         <form
           className="form-grid"
           onSubmit={(e) => {
@@ -243,10 +243,15 @@ export default function App() {
                 <td>{c.resolved ? `${c.payout_band}%` : "-"}</td>
                 <td>{c.paid_out ? "Yes" : "No"}</td>
                 <td>
-                  {!c.resolved && (
+                  {!c.resolved && c.has_defense && (
                     <button onClick={() => runAction(() => resolveClaim(id), "Claim resolved.", "Resolving claim...")}>
                       Resolve claim
                     </button>
+                  )}
+                  {!c.resolved && !c.has_defense && (
+                    <span style={{ color: "#9da7b3", fontSize: "0.85rem" }}>
+                      Awaiting carrier defense
+                    </span>
                   )}
                   {c.resolved && !c.paid_out && (
                     <button onClick={() => runAction(() => releasePayout(id), "Payout released.", "Releasing payout...")}>

@@ -55,16 +55,16 @@ for the carrier to defend themselves. This version addresses both:
 3. **`submit_claim`** - only the *registered pharmacy address* may file a
    claim, with a narrative and an `evidence_url` (a photo of packaging/ice
    packs). This does **not** immediately produce a verdict.
-4. **`submit_defense`** *(optional, once)* - only the *registered carrier
+4. **`submit_defense`** *(required, once)* - only the *registered carrier
    address* may respond, with their own narrative and evidence URL (e.g.
-   photos showing the shipment was properly insulated).
-5. **`resolve_claim`** - callable by anyone once a claim exists. Validators
-   independently fetch *both* parties' evidence URLs themselves via
-   `gl.nondet.web.render(url, mode="screenshot")` and weigh both images
-   against both narratives via `gl.nondet.exec_prompt(images=[...])`,
-   then reach strict consensus on `liability` and a `payout_band`. If the
-   carrier never filed a defense, the arbitrator is told that explicitly
-   rather than silently assuming guilt.
+   photos showing the shipment was properly insulated). `resolve_claim`
+   will reject the call until this has been filed.
+5. **`resolve_claim`** - callable by anyone once a defense exists.
+   Validators independently fetch *both* parties' evidence URLs
+   themselves via `gl.nondet.web.render(url, mode="screenshot")` and
+   weigh both images against both narratives via
+   `gl.nondet.exec_prompt(images=[...])`, then reach strict consensus on
+   `liability` and a `payout_band`.
 6. **`release_payout`** - pays the resolved verdict's share of escrow to
    the shipment's *registered* pharmacy address. No caller-supplied
    recipient parameter exists anymore - this closes the arbitrary-payout
@@ -78,10 +78,18 @@ inherently tied to an authenticated account rather than free text anyone
 could post.
 
 **Known limitations / future work:**
-- There's no on-chain deadline forcing a minimum response window before
-  `resolve_claim` can be called - anyone can call it immediately, whether
-  or not the carrier has responded. A production version would add a
-  block-height-based deadline giving the carrier a guaranteed window.
+- A defense is now **required** before `resolve_claim` will succeed. This
+  closes the "carrier never gets a say" gap, but introduces a real
+  tradeoff: if a carrier simply never responds, the claim can never be
+  resolved and the pharmacy's escrowed funds stay locked indefinitely.
+  This version doesn't include a time-based fallback (e.g. "resolve
+  without a defense after N blocks") because reading a reliable on-chain
+  clock from a deterministic write method wasn't something verified
+  against GenLayer's current API in this build. A production version
+  should add such a deadline, or at minimum a "carrier explicitly waives
+  defense" method, so resolution is only ever blocked on the carrier's
+  genuine non-participation - a deliberate policy decision, not an
+  unavoidable side effect of the design.
 - Evidence *images* are visually verified, but the contract doesn't
   cryptographically prove a photo was taken at the claimed time/place. A
   natural extension would have shipment sensors or a device sign evidence
@@ -101,8 +109,8 @@ frontend/                        React claim-submission portal + dashboard
 | `register_shipment(shipment_id, carrier_address, pharmacy_address)` | write | Caller becomes the distributor; binds carrier and pharmacy addresses |
 | `fund_escrow(shipment_id)` | write, payable | Distributor or carrier locks GEN against a registered shipment |
 | `submit_claim(shipment_id, ..., evidence_url)` | write | Only the registered pharmacy may call this. Files a claim - no verdict yet. |
-| `submit_defense(claim_id, defense_narrative, defense_evidence_url)` | write | Only the registered carrier may call this, once, before resolution |
-| `resolve_claim(claim_id)` | write, non-deterministic | Callable by anyone. Validators fetch both parties' evidence URLs and reach strict consensus on `liability` and `payout_band`. |
+| `submit_defense(claim_id, defense_narrative, defense_evidence_url)` | write | Only the registered carrier may call this, once. Required before `resolve_claim` will succeed. |
+| `resolve_claim(claim_id)` | write, non-deterministic | Callable by anyone once a defense exists. Validators fetch both parties' evidence URLs and reach strict consensus on `liability` and `payout_band`. |
 | `release_payout(claim_id)` | write, deterministic | Pays out to the shipment's registered pharmacy address — no caller-supplied recipient |
 | `get_shipment` / `get_claim` / `get_all_claims` / `get_escrow_balance` | view | Read state |
 

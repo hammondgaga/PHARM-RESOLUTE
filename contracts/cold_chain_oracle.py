@@ -20,13 +20,13 @@ A claim is not a one-sided accusation. The flow is:
   4. submit_defense - only the registered carrier may respond, once, with
      their own narrative and evidence_url (e.g. photos showing the
      shipment was properly packed, or an insulated-box certificate).
-     Optional, but available before resolution.
-  5. resolve_claim - callable by anyone once the claim exists. Validators
-     independently review BOTH sides' narratives and fetch BOTH evidence
-     URLs themselves (gl.nondet.web.render + gl.nondet.exec_prompt with
-     images=[...]) and reach consensus on liability and a payout band.
-     If the carrier never filed a defense, the arbitrator is explicitly
-     told that and may weigh the absence of a response accordingly.
+     REQUIRED before resolution - resolve_claim will reject the call
+     until a defense has been filed.
+  5. resolve_claim - callable by anyone once a defense exists on the
+     claim. Validators independently review BOTH sides' narratives and
+     fetch BOTH evidence URLs themselves (gl.nondet.web.render +
+     gl.nondet.exec_prompt with images=[...]) and reach consensus on
+     liability and a payout band.
   6. release_payout - pays the resolved verdict's share of escrow to the
      shipment's registered pharmacy address. No caller-supplied recipient.
 
@@ -40,12 +40,18 @@ SECURITY MODEL
 - Contract-verified evidence: validators fetch evidence URLs themselves
   and visually inspect them, rather than trusting free text.
 
-Known limitation: there's no on-chain deadline forcing a carrier to
-respond within a time window before resolve_claim can be called - anyone
-can call it once a claim exists, whether or not a defense was filed. This
-keeps the flow from deadlocking if a carrier ignores it, at the cost of
-not guaranteeing the carrier a minimum response window. A production
-version would add a block-height-based deadline.
+Known limitation: a defense is now REQUIRED before resolve_claim will
+succeed. This closes the "carrier never gets a say" gap, but introduces a
+real tradeoff: if a carrier simply never responds, the claim can never be
+resolved and the pharmacy's escrowed funds stay locked indefinitely. This
+version does not include a time-based fallback (e.g. "resolve without a
+defense after N blocks") because reading a reliable on-chain clock from a
+deterministic write method wasn't something this version verified against
+GenLayer's current API. A production version should add such a deadline,
+or at minimum a "carrier explicitly waives defense" method so resolution
+is never blocked on total carrier silence - only on the carrier's genuine
+non-participation, which is a policy decision rather than an inherent
+constraint of this design.
 """
 
 from genlayer import *
@@ -261,18 +267,12 @@ class ColdChainOracle(gl.Contract):
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
         assert not claim.resolved, "claim already resolved"
+        assert claim.has_defense, "cannot resolve until the carrier has submitted a defense"
 
-        if claim.has_defense:
-            defense_section = f"""
+        defense_section = f"""
 CARRIER'S DEFENSE: {claim.defense_narrative}
 (The carrier has also submitted their own evidence photo/document, shown
 to you separately from the pharmacy's evidence.)
-"""
-        else:
-            defense_section = """
-CARRIER'S DEFENSE: The carrier did not submit a defense before this claim
-was resolved. Do not automatically assume fault because of this silence,
-but you may note that the pharmacy's evidence stands unrebutted.
 """
 
         prompt = f"""
