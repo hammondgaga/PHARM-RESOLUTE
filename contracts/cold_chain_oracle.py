@@ -7,8 +7,8 @@ disputes for temperature-sensitive pharmaceutical shipments (vaccines,
 insulin, some antibiotics) moving through Nigeria's multi-hop distribution
 networks (distributor -> carrier/dispatch -> pharmacy).
 
-DISPUTE MODEL (two-sided)
--------------------------
+DISPUTE MODEL (two-sided, with a deadline)
+-------------------------------------------
 A claim is not a one-sided accusation. The flow is:
 
   1. register_shipment - distributor binds a carrier and pharmacy address
@@ -17,46 +17,57 @@ A claim is not a one-sided accusation. The flow is:
   3. submit_claim - only the registered pharmacy may file a claim, with
      its evidence (narrative + an evidence_url pointing to a photo of
      packaging/ice packs). This does NOT immediately produce a verdict.
+     The claim's timestamp is recorded (deterministic - see below).
   4. submit_defense - only the registered carrier may respond, once, with
      their own narrative and evidence_url (e.g. photos showing the
      shipment was properly packed, or an insulated-box certificate).
-     REQUIRED before resolution - resolve_claim will reject the call
-     until a defense has been filed.
-  5. resolve_claim - callable by anyone once a defense exists on the
-     claim. Validators independently review BOTH sides' narratives and
-     fetch BOTH evidence URLs themselves (gl.nondet.web.render +
-     gl.nondet.exec_prompt with images=[...]) and reach consensus on
-     liability and a payout band.
+  5. resolve_claim - callable by anyone once EITHER:
+       a) the carrier has filed a defense, OR
+       b) DEFENSE_WINDOW_SECONDS has elapsed since the claim was filed
+          and the carrier still has not responded.
+     Validators independently review both sides' narratives (and both
+     evidence URLs, when present) and reach consensus on liability and a
+     payout band. If the carrier defaulted by silence, the arbitrator is
+     told this explicitly, so it can weigh it as a factor rather than
+     treat it as automatic full liability.
   6. release_payout - pays the resolved verdict's share of escrow to the
      shipment's registered pharmacy address. No caller-supplied recipient.
+
+DEADLINE MECHANISM
+-------------------
+Earlier versions of this contract required a defense unconditionally,
+which meant a carrier who never responded could lock a pharmacy's escrow
+forever. This version closes that gap using GenLayer's Transaction
+Context: `datetime.now(timezone.utc)` (and `time.time()`) inside a
+contract method return the enclosing transaction's timestamp, which is
+pinned and identical across all validators - it is deterministic, not a
+non-deterministic web fetch. That makes it safe to use directly in
+assertions without gl.eq_principle.
+
+This means silence has a cost (the claim eventually resolves without the
+carrier's side being heard) but not an unbounded one (the pharmacy is
+never permanently blocked from a verdict).
 
 SECURITY MODEL
 --------------
 - Role binding: only the registered pharmacy can file a claim or receive
-  a payout; only the registered carrier can file a defense. This closes
-  an earlier issue where any caller could submit unverified evidence and
-  redirect payout to an arbitrary address.
+  a payout; only the registered carrier can file a defense.
 - One claim per shipment: a `claimed` flag blocks resubmission.
 - Contract-verified evidence: validators fetch evidence URLs themselves
   and visually inspect them, rather than trusting free text.
-
-Known limitation: a defense is now REQUIRED before resolve_claim will
-succeed. This closes the "carrier never gets a say" gap, but introduces a
-real tradeoff: if a carrier simply never responds, the claim can never be
-resolved and the pharmacy's escrowed funds stay locked indefinitely. This
-version does not include a time-based fallback (e.g. "resolve without a
-defense after N blocks") because reading a reliable on-chain clock from a
-deterministic write method wasn't something this version verified against
-GenLayer's current API. A production version should add such a deadline,
-or at minimum a "carrier explicitly waives defense" method so resolution
-is never blocked on total carrier silence - only on the carrier's genuine
-non-participation, which is a policy decision rather than an inherent
-constraint of this design.
+- Deadline-gated resolution: resolution can never be blocked forever by
+  carrier silence, but also never proceeds early - only once a defense
+  exists or the response window has genuinely elapsed.
 """
 
 from genlayer import *
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
+
+# How long the carrier has to respond with a defense before a claim can
+# be resolved without one. 172800 seconds = 48 hours.
+DEFENSE_WINDOW_SECONDS: u32 = 172800
 
 
 @allow_storage
@@ -80,6 +91,7 @@ class Claim:
     gps_deviation_notes: str
     evidence_url: str
     submitted_by: Address
+    claim_timestamp: u32
     # carrier's side (optional)
     has_defense: bool
     defense_narrative: str
@@ -170,8 +182,8 @@ class ColdChainOracle(gl.Contract):
         """
         Files a cold-chain breach claim. Only callable by the shipment's
         registered pharmacy. Does not produce a verdict - the carrier
-        gets a chance to submit a defense (submit_defense) before anyone
-        calls resolve_claim.
+        gets DEFENSE_WINDOW_SECONDS to submit_defense before anyone can
+        call resolve_claim without one.
         """
         shipment = self.shipments.get(shipment_id)
         assert shipment is not None, "shipment not registered"
@@ -182,6 +194,8 @@ class ColdChainOracle(gl.Contract):
         claim_id = self.claim_counter
         self.claim_counter += 1
 
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
         self.claims[str(claim_id)] = Claim(
             shipment_id=shipment_id,
             last_known_temp_c=last_known_temp_c,
@@ -190,6 +204,7 @@ class ColdChainOracle(gl.Contract):
             gps_deviation_notes=gps_deviation_notes,
             evidence_url=evidence_url,
             submitted_by=sender,
+            claim_timestamp=now_ts,
             has_defense=False,
             defense_narrative="",
             defense_evidence_url="",
@@ -210,7 +225,7 @@ class ColdChainOracle(gl.Contract):
         return claim_id
 
     # ------------------------------------------------------------------
-    # Step 2 of the claim: carrier may defend (optional, once)
+    # Step 2 of the claim: carrier may defend (optional, once, in window)
     # ------------------------------------------------------------------
     @gl.public.write
     def submit_defense(
@@ -220,13 +235,22 @@ class ColdChainOracle(gl.Contract):
         Lets the shipment's registered carrier respond to a claim with
         their own narrative and evidence (e.g. a photo proving the
         package was properly insulated) before resolve_claim is called.
-        Only callable once per claim, and only before it is resolved.
+        Only callable once per claim, only before it is resolved, and
+        only within the defense window - after that, resolve_claim may
+        proceed without a defense and this method will reject late
+        submissions to avoid a defense landing after (or racing) a
+        resolution.
         """
         key = str(claim_id)
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
         assert not claim.resolved, "claim already resolved"
         assert not claim.has_defense, "a defense has already been filed for this claim"
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        assert (
+            now_ts - claim.claim_timestamp < DEFENSE_WINDOW_SECONDS
+        ), "the defense window for this claim has already elapsed"
 
         shipment = self.shipments.get(claim.shipment_id)
         assert shipment is not None, "shipment not found"
@@ -242,6 +266,7 @@ class ColdChainOracle(gl.Contract):
             gps_deviation_notes=claim.gps_deviation_notes,
             evidence_url=claim.evidence_url,
             submitted_by=claim.submitted_by,
+            claim_timestamp=claim.claim_timestamp,
             has_defense=True,
             defense_narrative=defense_narrative,
             defense_evidence_url=defense_evidence_url,
@@ -257,22 +282,41 @@ class ColdChainOracle(gl.Contract):
     @gl.public.write
     def resolve_claim(self, claim_id: int) -> None:
         """
-        Callable by anyone once a claim exists. Validators independently
-        fetch both parties' evidence URLs (if provided) as images and
-        weigh them against both narratives, then reach strict consensus
-        on liability and a payout band. If the carrier never filed a
-        defense, the arbitrator is told that explicitly.
+        Callable by anyone once EITHER a defense has been filed OR the
+        defense window has elapsed. Validators independently fetch both
+        parties' evidence URLs (if provided) as images and weigh them
+        against both narratives, then reach strict consensus on
+        liability and a payout band. If the carrier never filed a
+        defense, the arbitrator is told explicitly whether that was
+        because the window is still open (should not happen here, since
+        this is asserted against) or because the window elapsed without
+        a response.
         """
         key = str(claim_id)
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
         assert not claim.resolved, "claim already resolved"
-        assert claim.has_defense, "cannot resolve until the carrier has submitted a defense"
 
-        defense_section = f"""
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        window_elapsed = (now_ts - claim.claim_timestamp) >= DEFENSE_WINDOW_SECONDS
+
+        assert claim.has_defense or window_elapsed, (
+            "cannot resolve: no defense has been filed and the "
+            f"{DEFENSE_WINDOW_SECONDS}s response window has not yet elapsed"
+        )
+
+        if claim.has_defense:
+            defense_section = f"""
 CARRIER'S DEFENSE: {claim.defense_narrative}
 (The carrier has also submitted their own evidence photo/document, shown
 to you separately from the pharmacy's evidence.)
+"""
+        else:
+            defense_section = """
+CARRIER'S DEFENSE: none. The carrier did not respond within the response
+window. Silence alone is not proof of fault - weigh the pharmacy's
+evidence on its own merits, but you may note the absence of a rebuttal
+as a factor, not as automatic full liability.
 """
 
         prompt = f"""
@@ -343,6 +387,7 @@ Respond using ONLY this JSON format, with no other words or characters:
             gps_deviation_notes=claim.gps_deviation_notes,
             evidence_url=claim.evidence_url,
             submitted_by=claim.submitted_by,
+            claim_timestamp=claim.claim_timestamp,
             has_defense=claim.has_defense,
             defense_narrative=claim.defense_narrative,
             defense_evidence_url=claim.defense_evidence_url,
@@ -353,11 +398,16 @@ Respond using ONLY this JSON format, with no other words or characters:
         )
 
     def _claim_to_dict(self, c: Claim) -> dict:
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        deadline_ts = c.claim_timestamp + DEFENSE_WINDOW_SECONDS
         return {
             "shipment_id": c.shipment_id,
             "delay_narrative": c.delay_narrative,
             "packaging_condition": c.packaging_condition,
             "evidence_url": c.evidence_url,
+            "claim_timestamp": c.claim_timestamp,
+            "defense_deadline": deadline_ts,
+            "defense_window_expired": now_ts >= deadline_ts,
             "has_defense": c.has_defense,
             "defense_narrative": c.defense_narrative,
             "defense_evidence_url": c.defense_evidence_url,
@@ -419,6 +469,7 @@ Respond using ONLY this JSON format, with no other words or characters:
             gps_deviation_notes=claim.gps_deviation_notes,
             evidence_url=claim.evidence_url,
             submitted_by=claim.submitted_by,
+            claim_timestamp=claim.claim_timestamp,
             has_defense=claim.has_defense,
             defense_narrative=claim.defense_narrative,
             defense_evidence_url=claim.defense_evidence_url,
