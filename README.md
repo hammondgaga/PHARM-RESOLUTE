@@ -41,59 +41,95 @@ agro-inputs, vaccines for veterinary use) can call `fund_escrow` →
 `submit_claim` → `release_payout` against this same contract without being
 built into this frontend at all.
 
-## Dispute model (two-sided)
+## Dispute model (two-sided, with full settlement and a real deadline)
 
-An earlier review round flagged that any caller could submit unverified
-evidence and redirect an approved payout to an arbitrary address - and
-separately, the original design only let the pharmacy speak, with no way
-for the carrier to defend themselves. This version addresses both:
+Staff feedback across two review rounds asked for: role-gated evidence and
+payout (closed previously), a complete settlement path that accounts for
+every escrow remainder, a deadline (or waiver) so a claim can't be stuck
+forever on carrier silence, enforcement of valid liability/payout
+combinations, and multi-account contract tests. This version addresses
+all of it:
 
 1. **`register_shipment`** - the distributor binds a specific carrier and
-   pharmacy address to a `shipment_id` before anything else happens.
+   pharmacy address to a `shipment_id`.
 2. **`fund_escrow`** - distributor or carrier locks GEN against the
-   shipment.
-3. **`submit_claim`** - only the *registered pharmacy address* may file a
-   claim, with a narrative and an `evidence_url` (a photo of packaging/ice
-   packs). This does **not** immediately produce a verdict.
-4. **`submit_defense`** *(required, once)* - only the *registered carrier
-   address* may respond, with their own narrative and evidence URL (e.g.
-   photos showing the shipment was properly insulated). `resolve_claim`
-   will reject the call until this has been filed.
-5. **`resolve_claim`** - callable by anyone once a defense exists.
-   Validators independently fetch *both* parties' evidence URLs
-   themselves via `gl.nondet.web.render(url, mode="screenshot")` and
-   weigh both images against both narratives via
-   `gl.nondet.exec_prompt(images=[...])`, then reach strict consensus on
-   `liability` and a `payout_band`.
-6. **`release_payout`** - pays the resolved verdict's share of escrow to
-   the shipment's *registered* pharmacy address. No caller-supplied
-   recipient parameter exists anymore - this closes the arbitrary-payout
-   vulnerability directly.
+   shipment. Each funder's contribution is tracked individually
+   (`funder_contributions`), so it can be refunded precisely later even
+   if both the distributor and carrier both funded.
+3. **`submit_claim`** - only the registered pharmacy may file a claim,
+   with a narrative and an `evidence_url`. No verdict yet. Records a
+   `filed_at` timestamp.
+4. **`submit_defense`** *(optional)* - the registered carrier responds
+   with their own narrative and evidence URL. Unblocks resolution
+   immediately.
+5. **`waive_defense`** *(optional)* - alternative to `submit_defense`:
+   the carrier explicitly declines to respond. Also unblocks resolution
+   immediately, before any deadline.
+6. **The actual deadline** - if the carrier does *neither* of the above,
+   `resolve_claim` becomes callable once `DEFENSE_WINDOW_SECONDS` have
+   passed since `filed_at`. This is a genuine deterministic deadline, not
+   a waiver-dependent workaround: GenVM pins Python's clock
+   (`datetime.now()`, `time.time()`) to the current transaction's
+   timestamp, so every validator re-executing `resolve_claim` sees the
+   exact same value and agrees on whether the window has elapsed,
+   without needing an external time source. A carrier who does *nothing
+   at all* - not even a waiver - no longer blocks resolution forever.
+   **The contract currently sets `DEFENSE_WINDOW_SECONDS = 120` (2
+   minutes)** so the deadline path is actually observable in a normal
+   testing session instead of requiring a multi-day wait - raise this to
+   something like `172800`-`259200` (2-3 days) before a real deployment,
+   since a carrier needs realistic time to respond.
+7. **`resolve_claim`** - callable by anyone once a defense/waiver exists
+   *or* the deadline has passed. Validators fetch both parties' evidence
+   URLs (if any) as images and weigh them against both narratives, then
+   reach strict consensus on `liability` and a `payout_band`. The
+   verdict is checked against `ALLOWED_COMBINATIONS` before being
+   accepted - e.g. `"no_breach"` and `"force_majeure"` can only pair
+   with a 0% payout; `"carrier"` and `"distributor"` must pair with
+   25/50/75/100%, never 0 (a liability finding with no payout is
+   contradictory). An out-of-policy verdict causes the call to revert
+   rather than being silently accepted.
+8. **`settle_claim`** - pays the pharmacy its `payout_band` share of
+   escrow, **and** refunds every remaining unit to whoever actually
+   funded escrow, split proportionally to their tracked contributions.
+   Escrow is always drained to exactly zero afterward - no verdict, not
+   even a 0% one, leaves GEN stranded in the contract.
 
-Additional protections: a `claimed` flag blocks a second claim on the
-same shipment, and both `submit_claim`/`submit_defense` assert
-`gl.message.sender_address` matches the registered role - since that
-address is the cryptographic signer of the transaction, evidence is
-inherently tied to an authenticated account rather than free text anyone
-could post.
+`get_claim` exposes `filed_at` and `defense_deadline` so a frontend can
+show a countdown, and `is_resolvable(claim_id)` is a convenience view
+that returns whether `resolve_claim` would currently succeed.
 
-**Known limitations / future work:**
-- A defense is now **required** before `resolve_claim` will succeed. This
-  closes the "carrier never gets a say" gap, but introduces a real
-  tradeoff: if a carrier simply never responds, the claim can never be
-  resolved and the pharmacy's escrowed funds stay locked indefinitely.
-  This version doesn't include a time-based fallback (e.g. "resolve
-  without a defense after N blocks") because reading a reliable on-chain
-  clock from a deterministic write method wasn't something verified
-  against GenLayer's current API in this build. A production version
-  should add such a deadline, or at minimum a "carrier explicitly waives
-  defense" method, so resolution is only ever blocked on the carrier's
-  genuine non-participation - a deliberate policy decision, not an
-  unavoidable side effect of the design.
-- Evidence *images* are visually verified, but the contract doesn't
-  cryptographically prove a photo was taken at the claimed time/place. A
-  natural extension would have shipment sensors or a device sign evidence
-  at capture time, with the contract checking that signature.
+## Multi-account tests
+
+`tests/test_cold_chain_oracle.py` uses GenLayer's `gltest` framework
+(package `genlayer-test`, pytest-based) with four distinct signers
+(distributor, carrier, pharmacy, and an unrelated stranger) to verify:
+role binding, duplicate-claim protection, that resolution is blocked
+until a defense/waiver/deadline unlocks it, that a carrier can't both
+defend and waive, **the deadline mechanism itself** (resolution rejected
+before the window and accepted after it, with zero carrier response, by
+simulating time passing via `transaction_context={"genvm_datetime":
+...}` rather than waiting 3 real days), full settlement (pharmacy paid +
+escrow drained to zero regardless of verdict), double-settlement
+protection, and per-funder contribution tracking across multiple
+funders.
+
+This suite was written against `gltest`'s actual installed API - verified
+by installing `genlayer-test` and reading its source directly (the
+account-switching pattern, `contract.connect(account)`, and the
+`genvm_datetime` time-simulation parameter were both confirmed this way
+rather than guessed) - and all 18 tests collect cleanly under `pytest`.
+It has not been executed end-to-end against a live GenLayer node as part
+of building this project, since no node was available in the build
+environment; running it requires `gltest` installed and a GenLayer
+node/localnet available:
+
+```bash
+pip install genlayer-test
+gltest --network localnet
+# or against GenLayer Studio's simulator:
+gltest --network studionet
+```
 
 ## Architecture (updated)
 
@@ -109,9 +145,11 @@ frontend/                        React claim-submission portal + dashboard
 | `register_shipment(shipment_id, carrier_address, pharmacy_address)` | write | Caller becomes the distributor; binds carrier and pharmacy addresses |
 | `fund_escrow(shipment_id)` | write, payable | Distributor or carrier locks GEN against a registered shipment |
 | `submit_claim(shipment_id, ..., evidence_url)` | write | Only the registered pharmacy may call this. Files a claim - no verdict yet. |
-| `submit_defense(claim_id, defense_narrative, defense_evidence_url)` | write | Only the registered carrier may call this, once. Required before `resolve_claim` will succeed. |
-| `resolve_claim(claim_id)` | write, non-deterministic | Callable by anyone once a defense exists. Validators fetch both parties' evidence URLs and reach strict consensus on `liability` and `payout_band`. |
-| `release_payout(claim_id)` | write, deterministic | Pays out to the shipment's registered pharmacy address — no caller-supplied recipient |
+| `submit_defense(claim_id, defense_narrative, defense_evidence_url)` | write | Only the registered carrier may call this, once. Unblocks `resolve_claim` immediately. |
+| `waive_defense(claim_id)` | write | Only the registered carrier may call this, once. Explicitly declines to respond; also unblocks `resolve_claim` immediately. |
+| `resolve_claim(claim_id)` | write, non-deterministic | Callable by anyone once a defense/waiver exists, or once `DEFENSE_WINDOW_SECONDS` has elapsed since the claim was filed. Validators fetch both parties' evidence URLs and reach strict consensus on `liability` and `payout_band`, checked against `ALLOWED_COMBINATIONS`. |
+| `settle_claim(claim_id)` | write, deterministic | Pays the pharmacy its share and refunds the remainder to whoever funded escrow, proportionally. Drains escrow to exactly zero. |
+| `is_resolvable(claim_id)` | view | Whether `resolve_claim` would currently succeed |
 | `get_shipment` / `get_claim` / `get_all_claims` / `get_escrow_balance` | view | Read state |
 
 The non-deterministic reasoning is isolated inside `submit_claim`, wrapped

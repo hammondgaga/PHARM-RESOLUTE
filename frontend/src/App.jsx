@@ -4,8 +4,9 @@ import {
   fundEscrow,
   submitClaim,
   submitDefense,
+  waiveDefense,
   resolveClaim,
-  releasePayout,
+  settleClaim,
   getAllClaims,
   CONTRACT_ADDRESS,
   MY_ADDRESS,
@@ -184,8 +185,8 @@ export default function App() {
       </section>
 
       <section className="panel">
-        <h2>4. Carrier: submit a defense (required before resolution)</h2>
-        <p className="hint">Must be sent from the registered carrier account. A claim cannot be resolved until this has been filed.</p>
+        <h2>4. Carrier: submit a defense (or it auto-unlocks after 3 days)</h2>
+        <p className="hint">Must be sent from the registered carrier account. Resolution is blocked until a defense/waiver is filed, or the 3-day response window passes.</p>
         <form
           className="form-grid"
           onSubmit={(e) => {
@@ -214,6 +215,22 @@ export default function App() {
           </label>
           <button type="submit" disabled={loading}>Submit defense</button>
         </form>
+        <p className="hint">
+          Or, if there's no defense to offer:{" "}
+          <button
+            type="button"
+            disabled={loading || !defenseForm.claim_id}
+            onClick={() =>
+              runAction(
+                () => waiveDefense(Number(defenseForm.claim_id)),
+                "Defense waived. Claim can now be resolved.",
+                "Waiving defense..."
+              )
+            }
+          >
+            Waive defense for claim {defenseForm.claim_id || "#"}
+          </button>
+        </p>
       </section>
 
       {status && <p className="status">{status}</p>}
@@ -229,38 +246,46 @@ export default function App() {
               <th>Defense filed?</th>
               <th>Liability</th>
               <th>Payout band</th>
-              <th>Paid out</th>
+              <th>Settled</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
-            {Object.entries(claims).map(([id, c]) => (
-              <tr key={id}>
-                <td>{id}</td>
-                <td>{c.shipment_id}</td>
-                <td>{c.has_defense ? "Yes" : "No"}</td>
-                <td>{c.resolved ? c.liability : "pending"}</td>
-                <td>{c.resolved ? `${c.payout_band}%` : "-"}</td>
-                <td>{c.paid_out ? "Yes" : "No"}</td>
-                <td>
-                  {!c.resolved && c.has_defense && (
-                    <button onClick={() => runAction(() => resolveClaim(id), "Claim resolved.", "Resolving claim...")}>
-                      Resolve claim
-                    </button>
-                  )}
-                  {!c.resolved && !c.has_defense && (
-                    <span style={{ color: "#9da7b3", fontSize: "0.85rem" }}>
-                      Awaiting carrier defense
-                    </span>
-                  )}
-                  {c.resolved && !c.paid_out && (
-                    <button onClick={() => runAction(() => releasePayout(id), "Payout released.", "Releasing payout...")}>
-                      Release payout
-                    </button>
-                  )}
-                </td>
-              </tr>
-            ))}
+            {Object.entries(claims).map(([id, c]) => {
+              const nowSecs = Math.floor(Date.now() / 1000);
+              const deadlinePassed = c.defense_deadline && nowSecs >= c.defense_deadline;
+              const canResolve = !c.resolved && (c.has_defense || deadlinePassed);
+              return (
+                <tr key={id}>
+                  <td>{id}</td>
+                  <td>{c.shipment_id}</td>
+                  <td>{c.has_defense ? "Yes" : "No"}</td>
+                  <td>{c.resolved ? c.liability : "pending"}</td>
+                  <td>{c.resolved ? `${c.payout_band}%` : "-"}</td>
+                  <td>{c.settled ? "Yes" : "No"}</td>
+                  <td>
+                    {!c.resolved && canResolve && (
+                      <button onClick={() => runAction(() => resolveClaim(id), "Claim resolved.", "Resolving claim...")}>
+                        Resolve claim
+                      </button>
+                    )}
+                    {!c.resolved && !canResolve && (
+                      <span style={{ color: "#9da7b3", fontSize: "0.85rem" }}>
+                        Awaiting carrier defense/waiver, or deadline at{" "}
+                        {c.defense_deadline
+                          ? new Date(c.defense_deadline * 1000).toLocaleString()
+                          : "-"}
+                      </span>
+                    )}
+                    {c.resolved && !c.settled && (
+                      <button onClick={() => runAction(() => settleClaim(id), "Claim settled - pharmacy paid, remainder refunded.", "Settling claim...")}>
+                        Settle claim
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </section>

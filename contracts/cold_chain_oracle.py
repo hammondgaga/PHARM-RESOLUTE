@@ -7,67 +7,65 @@ disputes for temperature-sensitive pharmaceutical shipments (vaccines,
 insulin, some antibiotics) moving through Nigeria's multi-hop distribution
 networks (distributor -> carrier/dispatch -> pharmacy).
 
-DISPUTE MODEL (two-sided, with a deadline)
+DISPUTE MODEL (two-sided, with settlement)
 -------------------------------------------
-A claim is not a one-sided accusation. The flow is:
-
   1. register_shipment - distributor binds a carrier and pharmacy address
      to a shipment_id.
   2. fund_escrow - distributor or carrier locks GEN against the shipment.
-  3. submit_claim - only the registered pharmacy may file a claim, with
-     its evidence (narrative + an evidence_url pointing to a photo of
-     packaging/ice packs). This does NOT immediately produce a verdict.
-     The claim's timestamp is recorded (deterministic - see below).
-  4. submit_defense - only the registered carrier may respond, once, with
-     their own narrative and evidence_url (e.g. photos showing the
-     shipment was properly packed, or an insulated-box certificate).
-  5. resolve_claim - callable by anyone once EITHER:
-       a) the carrier has filed a defense, OR
-       b) DEFENSE_WINDOW_SECONDS has elapsed since the claim was filed
-          and the carrier still has not responded.
-     Validators independently review both sides' narratives (and both
-     evidence URLs, when present) and reach consensus on liability and a
-     payout band. If the carrier defaulted by silence, the arbitrator is
-     told this explicitly, so it can weigh it as a factor rather than
-     treat it as automatic full liability.
-  6. release_payout - pays the resolved verdict's share of escrow to the
-     shipment's registered pharmacy address. No caller-supplied recipient.
+     Each funder's contribution is tracked individually so it can be
+     refunded later.
+  3. submit_claim - only the registered pharmacy may file a claim, with a
+     narrative and an evidence_url (a photo of packaging/ice packs). No
+     verdict yet. Records a filed_at timestamp.
+  4. submit_defense OR waive_defense - the registered carrier may respond
+     with a narrative and evidence_url, or explicitly decline. Either
+     unblocks resolution immediately, before any deadline.
+  5. resolve_claim - callable by anyone once EITHER a defense/waiver
+     exists OR DEFENSE_WINDOW_SECONDS has elapsed since filed_at (a real,
+     deterministic deadline - see below). Validators independently fetch
+     both parties' evidence URLs (if any) as images and weigh them
+     against both narratives via gl.nondet.exec_prompt, then reach strict
+     consensus on liability and a payout_band, checked against an
+     explicit allow-list before being accepted.
+  6. settle_claim - pays the resolved payout_band's share of escrow to
+     the shipment's registered pharmacy address, AND refunds whatever
+     remains to whoever actually funded escrow (distributor and/or
+     carrier), split proportionally to their contributions. Every GEN in
+     escrow is accounted for regardless of verdict - none is ever left
+     stranded in the contract.
 
-DEADLINE MECHANISM
--------------------
-Earlier versions of this contract required a defense unconditionally,
-which meant a carrier who never responded could lock a pharmacy's escrow
-forever. This version closes that gap using GenLayer's Transaction
-Context: `datetime.now(timezone.utc)` (and `time.time()`) inside a
-contract method return the enclosing transaction's timestamp, which is
-pinned and identical across all validators - it is deterministic, not a
-non-deterministic web fetch. That makes it safe to use directly in
-assertions without gl.eq_principle.
-
-This means silence has a cost (the claim eventually resolves without the
-carrier's side being heard) but not an unbounded one (the pharmacy is
-never permanently blocked from a verdict).
+DETERMINISTIC TIME (the actual deadline mechanism)
+----------------------------------------------------
+GenVM pins Python's clock (datetime.now(), time.time()) to the current
+transaction's timestamp - every validator re-executing the transaction
+sees the exact same value, so it's safe to use for storage and
+comparisons without breaking consensus (this is different from fetching
+"now" from an external source, which would need a non-deterministic
+block). submit_claim records filed_at using this clock; resolve_claim
+compares it against DEFENSE_WINDOW_SECONDS to decide whether enough time
+has passed to proceed even without any carrier response at all. This
+closes the gap a waiver-only design has: a carrier who does nothing -
+not even an explicit waiver - no longer blocks resolution forever.
 
 SECURITY MODEL
 --------------
 - Role binding: only the registered pharmacy can file a claim or receive
-  a payout; only the registered carrier can file a defense.
+  a payout; only the registered carrier can defend, waive, or receive a
+  refund. This closes an earlier issue where any caller could submit
+  unverified evidence and redirect payout to an arbitrary address.
 - One claim per shipment: a `claimed` flag blocks resubmission.
 - Contract-verified evidence: validators fetch evidence URLs themselves
   and visually inspect them, rather than trusting free text.
-- Deadline-gated resolution: resolution can never be blocked forever by
-  carrier silence, but also never proceeds early - only once a defense
-  exists or the response window has genuinely elapsed.
+- Enforced liability/payout combinations: resolve_claim rejects any
+  validator verdict that doesn't match a fixed allow-list, so e.g.
+  "no_breach" can never be paired with a nonzero payout by mistake or
+  manipulation.
 """
 
 from genlayer import *
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-
-# How long the carrier has to respond with a defense before a claim can
-# be resolved without one. 172800 seconds = 48 hours.
-DEFENSE_WINDOW_SECONDS: u32 = 172800
 
 
 @allow_storage
@@ -91,8 +89,8 @@ class Claim:
     gps_deviation_notes: str
     evidence_url: str
     submitted_by: Address
-    claim_timestamp: u32
-    # carrier's side (optional)
+    filed_at: u32  # unix seconds, deterministic transaction timestamp
+    # carrier's side (defense, waiver, or deadline unlocks resolution)
     has_defense: bool
     defense_narrative: str
     defense_evidence_url: str
@@ -100,19 +98,42 @@ class Claim:
     resolved: bool
     liability: str
     payout_band: u32
-    paid_out: bool
+    settled: bool
+
+
+# How long the carrier has to defend or waive before resolve_claim may
+# proceed without any response at all. Backed by GenVM's deterministic
+# transaction timestamp (see module docstring), not external wall-clock
+# time, so all validators agree on whether the window has elapsed.
+#
+# Set short here so the deadline path is actually observable in a normal
+# testing session (submit a claim, wait ~2 minutes, resolve without any
+# defense). Raise this substantially - e.g. 172800-259200 (2-3 days) -
+# before a real deployment; a carrier needs realistic time to respond.
+DEFENSE_WINDOW_SECONDS = 120  # 2 minutes - TESTING VALUE, raise for production
+
+# Allowed (liability -> valid payout_band values) combinations. Enforced
+# deterministically after validators reach consensus on a verdict.
+ALLOWED_COMBINATIONS = {
+    "no_breach": (0,),
+    "force_majeure": (0,),
+    "carrier": (25, 50, 75, 100),
+    "distributor": (25, 50, 75, 100),
+}
 
 
 class ColdChainOracle(gl.Contract):
     shipments: TreeMap[str, Shipment]
     claims: TreeMap[str, Claim]
     claim_counter: u32
+    # f"{shipment_id}:{funder_address_hex}" -> amount that funder contributed
+    funder_contributions: TreeMap[str, bigint]
 
     def __init__(self):
         self.claim_counter = 0
 
     # ------------------------------------------------------------------
-    # Shipment registration (binds authenticated roles to a shipment)
+    # Shipment registration
     # ------------------------------------------------------------------
     @gl.public.write
     def register_shipment(
@@ -141,7 +162,7 @@ class ColdChainOracle(gl.Contract):
         }
 
     # ------------------------------------------------------------------
-    # Escrow funding (deterministic, restricted to distributor or carrier)
+    # Escrow funding - contributions tracked per funder for later refund
     # ------------------------------------------------------------------
     @gl.public.write.payable
     def fund_escrow(self, shipment_id: str) -> None:
@@ -161,6 +182,10 @@ class ColdChainOracle(gl.Contract):
             claimed=shipment.claimed,
         )
 
+        contrib_key = f"{shipment_id}:{sender.as_hex}"
+        current = self.funder_contributions.get(contrib_key, 0)
+        self.funder_contributions[contrib_key] = current + amount
+
     @gl.public.view
     def get_escrow_balance(self, shipment_id: str) -> int:
         s = self.shipments.get(shipment_id)
@@ -179,12 +204,6 @@ class ColdChainOracle(gl.Contract):
         gps_deviation_notes: str,
         evidence_url: str,
     ) -> int:
-        """
-        Files a cold-chain breach claim. Only callable by the shipment's
-        registered pharmacy. Does not produce a verdict - the carrier
-        gets DEFENSE_WINDOW_SECONDS to submit_defense before anyone can
-        call resolve_claim without one.
-        """
         shipment = self.shipments.get(shipment_id)
         assert shipment is not None, "shipment not registered"
         sender = gl.message.sender_address
@@ -193,8 +212,7 @@ class ColdChainOracle(gl.Contract):
 
         claim_id = self.claim_counter
         self.claim_counter += 1
-
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+        now = u32(int(datetime.now(timezone.utc).timestamp()))
 
         self.claims[str(claim_id)] = Claim(
             shipment_id=shipment_id,
@@ -204,14 +222,14 @@ class ColdChainOracle(gl.Contract):
             gps_deviation_notes=gps_deviation_notes,
             evidence_url=evidence_url,
             submitted_by=sender,
-            claim_timestamp=now_ts,
+            filed_at=now,
             has_defense=False,
             defense_narrative="",
             defense_evidence_url="",
             resolved=False,
             liability="",
             payout_band=0,
-            paid_out=False,
+            settled=False,
         )
 
         self.shipments[shipment_id] = Shipment(
@@ -224,40 +242,28 @@ class ColdChainOracle(gl.Contract):
 
         return claim_id
 
+    def _require_carrier_and_open_claim(self, claim_id: int):
+        key = str(claim_id)
+        claim = self.claims.get(key)
+        assert claim is not None, "claim does not exist"
+        assert not claim.resolved, "claim already resolved"
+        assert not claim.has_defense, "a defense/waiver has already been filed for this claim"
+
+        shipment = self.shipments.get(claim.shipment_id)
+        assert shipment is not None, "shipment not found"
+        assert gl.message.sender_address == shipment.carrier, (
+            "only the registered carrier may respond to this claim"
+        )
+        return key, claim
+
     # ------------------------------------------------------------------
-    # Step 2 of the claim: carrier may defend (optional, once, in window)
+    # Step 2a: carrier defends with their own evidence
     # ------------------------------------------------------------------
     @gl.public.write
     def submit_defense(
         self, claim_id: int, defense_narrative: str, defense_evidence_url: str
     ) -> None:
-        """
-        Lets the shipment's registered carrier respond to a claim with
-        their own narrative and evidence (e.g. a photo proving the
-        package was properly insulated) before resolve_claim is called.
-        Only callable once per claim, only before it is resolved, and
-        only within the defense window - after that, resolve_claim may
-        proceed without a defense and this method will reject late
-        submissions to avoid a defense landing after (or racing) a
-        resolution.
-        """
-        key = str(claim_id)
-        claim = self.claims.get(key)
-        assert claim is not None, "claim does not exist"
-        assert not claim.resolved, "claim already resolved"
-        assert not claim.has_defense, "a defense has already been filed for this claim"
-
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        assert (
-            now_ts - claim.claim_timestamp < DEFENSE_WINDOW_SECONDS
-        ), "the defense window for this claim has already elapsed"
-
-        shipment = self.shipments.get(claim.shipment_id)
-        assert shipment is not None, "shipment not found"
-        assert gl.message.sender_address == shipment.carrier, (
-            "only the registered carrier may file a defense"
-        )
-
+        key, claim = self._require_carrier_and_open_claim(claim_id)
         self.claims[key] = Claim(
             shipment_id=claim.shipment_id,
             last_known_temp_c=claim.last_known_temp_c,
@@ -266,14 +272,38 @@ class ColdChainOracle(gl.Contract):
             gps_deviation_notes=claim.gps_deviation_notes,
             evidence_url=claim.evidence_url,
             submitted_by=claim.submitted_by,
-            claim_timestamp=claim.claim_timestamp,
+            filed_at=claim.filed_at,
             has_defense=True,
             defense_narrative=defense_narrative,
             defense_evidence_url=defense_evidence_url,
             resolved=claim.resolved,
             liability=claim.liability,
             payout_band=claim.payout_band,
-            paid_out=claim.paid_out,
+            settled=claim.settled,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 2b: carrier explicitly waives their right to respond
+    # ------------------------------------------------------------------
+    @gl.public.write
+    def waive_defense(self, claim_id: int) -> None:
+        key, claim = self._require_carrier_and_open_claim(claim_id)
+        self.claims[key] = Claim(
+            shipment_id=claim.shipment_id,
+            last_known_temp_c=claim.last_known_temp_c,
+            delay_narrative=claim.delay_narrative,
+            packaging_condition=claim.packaging_condition,
+            gps_deviation_notes=claim.gps_deviation_notes,
+            evidence_url=claim.evidence_url,
+            submitted_by=claim.submitted_by,
+            filed_at=claim.filed_at,
+            has_defense=True,
+            defense_narrative="(The carrier was given the opportunity to respond and explicitly waived their right to submit a defense.)",
+            defense_evidence_url="",
+            resolved=claim.resolved,
+            liability=claim.liability,
+            payout_band=claim.payout_band,
+            settled=claim.settled,
         )
 
     # ------------------------------------------------------------------
@@ -281,48 +311,33 @@ class ColdChainOracle(gl.Contract):
     # ------------------------------------------------------------------
     @gl.public.write
     def resolve_claim(self, claim_id: int) -> None:
-        """
-        Callable by anyone once EITHER a defense has been filed OR the
-        defense window has elapsed. Validators independently fetch both
-        parties' evidence URLs (if provided) as images and weigh them
-        against both narratives, then reach strict consensus on
-        liability and a payout band. If the carrier never filed a
-        defense, the arbitrator is told explicitly whether that was
-        because the window is still open (should not happen here, since
-        this is asserted against) or because the window elapsed without
-        a response.
-        """
         key = str(claim_id)
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
         assert not claim.resolved, "claim already resolved"
 
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        window_elapsed = (now_ts - claim.claim_timestamp) >= DEFENSE_WINDOW_SECONDS
-
-        assert claim.has_defense or window_elapsed, (
-            "cannot resolve: no defense has been filed and the "
-            f"{DEFENSE_WINDOW_SECONDS}s response window has not yet elapsed"
+        now = int(datetime.now(timezone.utc).timestamp())
+        deadline_passed = now >= int(claim.filed_at) + DEFENSE_WINDOW_SECONDS
+        assert claim.has_defense or deadline_passed, (
+            f"cannot resolve: carrier has not responded and the "
+            f"{DEFENSE_WINDOW_SECONDS}s response window has not elapsed yet"
         )
 
         if claim.has_defense:
-            defense_section = f"""
-CARRIER'S DEFENSE: {claim.defense_narrative}
-(The carrier has also submitted their own evidence photo/document, shown
-to you separately from the pharmacy's evidence.)
-"""
+            carrier_section = f"CARRIER'S RESPONSE: {claim.defense_narrative}"
         else:
-            defense_section = """
-CARRIER'S DEFENSE: none. The carrier did not respond within the response
-window. Silence alone is not proof of fault - weigh the pharmacy's
-evidence on its own merits, but you may note the absence of a rebuttal
-as a factor, not as automatic full liability.
-"""
+            carrier_section = (
+                "CARRIER'S RESPONSE: The carrier did not respond at all "
+                f"within the {DEFENSE_WINDOW_SECONDS}-second response window, "
+                "and that window has now passed. Do not automatically assume "
+                "fault because of this silence, but the pharmacy's evidence "
+                "stands entirely unrebutted."
+            )
 
         prompt = f"""
 You are an impartial cold-chain logistics arbitrator for pharmaceutical
-shipments distributed across Nigeria. This is a two-sided dispute -
-weigh both the pharmacy's claim and the carrier's defense (if any) fairly
+shipments distributed across Nigeria. This is a two-sided dispute - weigh
+both the pharmacy's claim and the carrier's response (if any) fairly
 before deciding liability.
 
 SHIPMENT ID: {claim.shipment_id}
@@ -332,7 +347,8 @@ LAST KNOWN TEMPERATURE READING: {claim.last_known_temp_c}
 DELAY / TRANSIT NARRATIVE: {claim.delay_narrative}
 PACKAGING CONDITION ON ARRIVAL (pharmacist's note): {claim.packaging_condition}
 GPS / ROUTE DEVIATION NOTES: {claim.gps_deviation_notes}
-{defense_section}
+
+{carrier_section}
 
 You have been given photo/screenshot evidence for whichever side(s)
 submitted an evidence_url. Weigh what you can actually observe in each
@@ -346,15 +362,18 @@ circumstances (flooding, civil unrest, accidents).
 
 Decide exactly:
 1. liability: one of "carrier", "distributor", "force_majeure", "no_breach"
-2. payout_band: one of 0, 25, 50, 75, 100
-   (percentage of the escrowed shipment value owed to the pharmacy)
+2. payout_band: one of 0, 25, 50, 75, 100 (percentage of escrowed value
+   owed to the pharmacy). IMPORTANT: "no_breach" and "force_majeure" must
+   use payout_band 0. "carrier" and "distributor" must use 25, 50, 75, or
+   100 - never 0, since finding a party liable with a 0% payout is
+   contradictory.
 
 Respond using ONLY this JSON format, with no other words or characters:
 {{"liability": "<carrier|distributor|force_majeure|no_breach>", "payout_band": <0|25|50|75|100>}}
 """
 
         pharmacy_evidence_url = claim.evidence_url
-        carrier_evidence_url = claim.defense_evidence_url if claim.has_defense else ""
+        carrier_evidence_url = claim.defense_evidence_url
 
         def nondet():
             images = []
@@ -379,6 +398,14 @@ Respond using ONLY this JSON format, with no other words or characters:
         verdict_json = gl.eq_principle.strict_eq(nondet)
         verdict = json.loads(verdict_json)
 
+        liability = verdict["liability"]
+        payout_band = verdict["payout_band"]
+        allowed_bands = ALLOWED_COMBINATIONS.get(liability)
+        assert allowed_bands is not None, "validators returned an unrecognized liability value"
+        assert payout_band in allowed_bands, (
+            f"validators returned an invalid combination: {liability} with payout_band {payout_band}"
+        )
+
         self.claims[key] = Claim(
             shipment_id=claim.shipment_id,
             last_known_temp_c=claim.last_known_temp_c,
@@ -387,34 +414,31 @@ Respond using ONLY this JSON format, with no other words or characters:
             gps_deviation_notes=claim.gps_deviation_notes,
             evidence_url=claim.evidence_url,
             submitted_by=claim.submitted_by,
-            claim_timestamp=claim.claim_timestamp,
+            filed_at=claim.filed_at,
             has_defense=claim.has_defense,
             defense_narrative=claim.defense_narrative,
             defense_evidence_url=claim.defense_evidence_url,
             resolved=True,
-            liability=verdict["liability"],
-            payout_band=verdict["payout_band"],
-            paid_out=False,
+            liability=liability,
+            payout_band=payout_band,
+            settled=False,
         )
 
     def _claim_to_dict(self, c: Claim) -> dict:
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        deadline_ts = c.claim_timestamp + DEFENSE_WINDOW_SECONDS
         return {
             "shipment_id": c.shipment_id,
             "delay_narrative": c.delay_narrative,
             "packaging_condition": c.packaging_condition,
             "evidence_url": c.evidence_url,
-            "claim_timestamp": c.claim_timestamp,
-            "defense_deadline": deadline_ts,
-            "defense_window_expired": now_ts >= deadline_ts,
+            "filed_at": c.filed_at,
+            "defense_deadline": int(c.filed_at) + DEFENSE_WINDOW_SECONDS,
             "has_defense": c.has_defense,
             "defense_narrative": c.defense_narrative,
             "defense_evidence_url": c.defense_evidence_url,
             "resolved": c.resolved,
             "liability": c.liability,
             "payout_band": c.payout_band,
-            "paid_out": c.paid_out,
+            "settled": c.settled,
         }
 
     @gl.public.view
@@ -431,35 +455,68 @@ Respond using ONLY this JSON format, with no other words or characters:
             result[key] = self._claim_to_dict(c)
         return result
 
+    @gl.public.view
+    def is_resolvable(self, claim_id: int) -> bool:
+        """True once resolve_claim would succeed: either a defense/waiver
+        has been filed, or the response deadline has passed."""
+        c = self.claims.get(str(claim_id))
+        if c is None or c.resolved:
+            return False
+        if c.has_defense:
+            return True
+        now = int(datetime.now(timezone.utc).timestamp())
+        return now >= int(c.filed_at) + DEFENSE_WINDOW_SECONDS
+
+    @gl.public.view
+    def get_funder_contribution(self, shipment_id: str, funder_address: str) -> int:
+        return self.funder_contributions.get(f"{shipment_id}:{funder_address}", 0)
+
     # ------------------------------------------------------------------
-    # Payout execution (deterministic; recipient is always the shipment's
-    # registered pharmacy address, never a caller-supplied one)
+    # Step 4: full settlement - pays pharmacy's share AND refunds every
+    # remaining unit of escrow back to whoever funded it. No verdict ever
+    # leaves GEN stranded in the contract.
     # ------------------------------------------------------------------
     @gl.public.write
-    def release_payout(self, claim_id: int) -> None:
+    def settle_claim(self, claim_id: int) -> None:
         key = str(claim_id)
         claim = self.claims.get(key)
         assert claim is not None, "claim does not exist"
         assert claim.resolved, "claim not yet resolved"
-        assert not claim.paid_out, "claim already paid out"
+        assert not claim.settled, "claim already settled"
 
         shipment = self.shipments.get(claim.shipment_id)
         assert shipment is not None, "shipment not found"
 
         pool = shipment.escrow_balance
         payout = (pool * claim.payout_band) // 100
+        remainder = pool - payout
 
         if payout > 0:
-            recipient = gl.get_contract_at(shipment.pharmacy)
-            recipient.emit_transfer(value=payout)
+            gl.get_contract_at(shipment.pharmacy).emit_transfer(value=payout)
 
-            self.shipments[claim.shipment_id] = Shipment(
-                distributor=shipment.distributor,
-                carrier=shipment.carrier,
-                pharmacy=shipment.pharmacy,
-                escrow_balance=pool - payout,
-                claimed=shipment.claimed,
-            )
+        if remainder > 0:
+            distributor_key = f"{claim.shipment_id}:{shipment.distributor.as_hex}"
+            carrier_key = f"{claim.shipment_id}:{shipment.carrier.as_hex}"
+            distributor_contribution = self.funder_contributions.get(distributor_key, 0)
+            carrier_contribution = self.funder_contributions.get(carrier_key, 0)
+            total_contribution = distributor_contribution + carrier_contribution
+
+            if total_contribution > 0:
+                distributor_refund = (remainder * distributor_contribution) // total_contribution
+                carrier_refund = remainder - distributor_refund  # remainder always fully allocated
+
+                if distributor_refund > 0:
+                    gl.get_contract_at(shipment.distributor).emit_transfer(value=distributor_refund)
+                if carrier_refund > 0:
+                    gl.get_contract_at(shipment.carrier).emit_transfer(value=carrier_refund)
+
+        self.shipments[claim.shipment_id] = Shipment(
+            distributor=shipment.distributor,
+            carrier=shipment.carrier,
+            pharmacy=shipment.pharmacy,
+            escrow_balance=0,
+            claimed=shipment.claimed,
+        )
 
         self.claims[key] = Claim(
             shipment_id=claim.shipment_id,
@@ -469,12 +526,12 @@ Respond using ONLY this JSON format, with no other words or characters:
             gps_deviation_notes=claim.gps_deviation_notes,
             evidence_url=claim.evidence_url,
             submitted_by=claim.submitted_by,
-            claim_timestamp=claim.claim_timestamp,
+            filed_at=claim.filed_at,
             has_defense=claim.has_defense,
             defense_narrative=claim.defense_narrative,
             defense_evidence_url=claim.defense_evidence_url,
             resolved=claim.resolved,
             liability=claim.liability,
             payout_band=claim.payout_band,
-            paid_out=True,
+            settled=True,
         )

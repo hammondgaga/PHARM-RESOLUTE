@@ -46,9 +46,11 @@ export const submitClaim = (fields) =>
 export const submitDefense = (claimId, defenseNarrative, defenseEvidenceUrl) =>
   write("submit_defense", [claimId, defenseNarrative, defenseEvidenceUrl]);
 
+export const waiveDefense = (claimId) => write("waive_defense", [claimId]);
+
 export const resolveClaim = (claimId) => write("resolve_claim", [claimId]);
 
-export const releasePayout = (claimId) => write("release_payout", [claimId]);
+export const settleClaim = (claimId) => write("settle_claim", [claimId]);
 
 export async function getAllClaims() {
   return client.readContract({ address: CONTRACT_ADDRESS, functionName: "get_all_claims", args: [] });
