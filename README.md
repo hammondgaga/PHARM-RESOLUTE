@@ -152,11 +152,24 @@ frontend/                        React claim-submission portal + dashboard
 | `is_resolvable(claim_id)` | view | Whether `resolve_claim` would currently succeed |
 | `get_shipment` / `get_claim` / `get_all_claims` / `get_escrow_balance` | view | Read state |
 
-The non-deterministic reasoning is isolated inside `submit_claim`, wrapped
+The non-deterministic reasoning is isolated inside `resolve_claim`, wrapped
 in `gl.eq_principle.strict_eq`, per GenLayer's pattern for LLM-backed
 methods — validators only need to agree on the structured verdict
 (`liability`, `payout_band`), not on free-text wording, which keeps
 consensus reliable.
+
+**Evidence-fetch robustness.** `resolve_claim` fetches each side's
+`evidence_url` as a screenshot before showing it to the arbitrator. A real
+bug surfaced during manual testing: a defense evidence field accidentally
+held a raw `data:image/...` URI instead of a real link, and
+`gl.nondet.web.render` rejected it identically on every validator - which
+reached a valid *consensus on the failure*, but since `submit_defense` is
+one-shot, that permanently bricked the claim (no way to ever resolve it).
+`resolve_claim` now catches this: unfetchable or non-http(s) evidence URLs
+are skipped, with the arbitrator explicitly told a given side's evidence
+couldn't be retrieved so it can still judge fairly on the narrative alone,
+rather than the whole transaction reverting forever. Covered by
+`TestEvidenceRobustness` in the test suite.
 
 > **Known limitation / future work:** the arbitrator's free-text reasoning
 > is intentionally left out of the consensus payload, since exact wording
@@ -165,9 +178,9 @@ consensus reliable.
 > non-comparative Equivalence Principle so the dashboard can show
 > validator-agreed reasoning, not just the verdict.
 
-**Frontend** — a claim submission form (pharmacy fills in the evidence
-fields) and a dashboard of resolved claims with a payout-release action,
-built with React + `genlayer-js`.
+**Frontend** — a multi-step form (register shipment, fund escrow, submit
+claim, submit defense/waive) and a claims dashboard with resolve/settle
+actions, built with React + `genlayer-js`.
 
 ## Running locally
 

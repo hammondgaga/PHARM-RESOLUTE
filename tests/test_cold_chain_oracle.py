@@ -266,6 +266,50 @@ class TestDeadline:
         assert contract.is_resolvable(args=[int(claim_id)]).call() is True
 
 
+class TestEvidenceRobustness:
+    """
+    Regression test for a real bug hit during manual testing: a claim whose
+    evidence_url was accidentally a raw data:image/... URI (not a fetchable
+    http(s) link) caused gl.nondet.web.render to raise inside every
+    validator identically, which reached consensus on the FAILURE itself
+    and permanently bricked that claim - submit_claim/submit_defense are
+    one-shot, so resolve_claim could never succeed on it again. The fix:
+    resolve_claim now catches bad/unfetchable URLs and proceeds on the
+    narrative alone rather than reverting unconditionally.
+    """
+
+    def test_resolve_succeeds_despite_non_http_evidence_url(self, contract, accounts):
+        _register(contract, accounts, "shp-badurl-1")
+        _fund(contract, accounts, "shp-badurl-1", 1000)
+
+        tx = _as(contract, accounts["pharmacy"]).submit_claim(
+            args=[
+                "shp-badurl-1",
+                "9C",
+                "delay",
+                "condition",
+                "gps",
+                "data:image/jpeg;base64,notarealurl",  # the exact bug hit manually
+            ]
+        ).transact()
+        assert tx_execution_succeeded(tx)
+
+        claims = contract.get_all_claims().call()
+        claim_id = max(claims.keys(), key=int)
+
+        waive_tx = _as(contract, accounts["carrier"]).waive_defense(args=[int(claim_id)]).transact()
+        assert tx_execution_succeeded(waive_tx)
+
+        resolve_tx = _as(contract, accounts["stranger"]).resolve_claim(args=[int(claim_id)]).transact()
+        assert tx_execution_succeeded(resolve_tx), (
+            "resolve_claim should not revert just because an evidence_url "
+            "wasn't a fetchable http(s) link"
+        )
+
+        claim = contract.get_claim(args=[int(claim_id)]).call()
+        assert claim["resolved"] is True
+
+
 class TestSettlement:
     def test_settlement_pays_pharmacy_and_drains_escrow_to_zero(self, contract, accounts):
         """

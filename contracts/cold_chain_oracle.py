@@ -375,17 +375,53 @@ Respond using ONLY this JSON format, with no other words or characters:
         pharmacy_evidence_url = claim.evidence_url
         carrier_evidence_url = claim.defense_evidence_url
 
+        def _try_fetch_evidence_image(url):
+            """
+            Returns (image_or_None, problem_or_None). Never raises - a bad
+            or unfetchable URL (e.g. a data: URI instead of a real http(s)
+            link, a dead link, a timeout) should not permanently brick a
+            claim's ability to ever be resolved, since submit_claim and
+            submit_defense are both one-shot: if resolve_claim reverted
+            unconditionally on a bad URL, that claim could never resolve
+            again. Instead we skip the image and tell the arbitrator why.
+            """
+            if not url:
+                return None, None
+            if not (url.startswith("http://") or url.startswith("https://")):
+                return None, "was not a fetchable web link (only http/https URLs are supported, not embedded image data)"
+            try:
+                return gl.nondet.web.render(url, mode="screenshot"), None
+            except Exception as e:
+                return None, f"could not be fetched ({e})"
+
         def nondet():
             images = []
-            if pharmacy_evidence_url:
-                images.append(gl.nondet.web.render(pharmacy_evidence_url, mode="screenshot"))
-            if carrier_evidence_url:
-                images.append(gl.nondet.web.render(carrier_evidence_url, mode="screenshot"))
+            notes = []
+
+            pharmacy_image, pharmacy_problem = _try_fetch_evidence_image(pharmacy_evidence_url)
+            if pharmacy_image is not None:
+                images.append(pharmacy_image)
+            elif pharmacy_problem:
+                notes.append(
+                    f"NOTE: the pharmacy's evidence_url {pharmacy_problem} - "
+                    "judge this side on its written narrative alone."
+                )
+
+            carrier_image, carrier_problem = _try_fetch_evidence_image(carrier_evidence_url)
+            if carrier_image is not None:
+                images.append(carrier_image)
+            elif carrier_problem:
+                notes.append(
+                    f"NOTE: the carrier's evidence_url {carrier_problem} - "
+                    "judge this side on its written narrative alone."
+                )
+
+            final_prompt = prompt if not notes else prompt + "\n\n" + "\n".join(notes)
 
             if images:
-                res = gl.nondet.exec_prompt(prompt, images=images, response_format="json")
+                res = gl.nondet.exec_prompt(final_prompt, images=images, response_format="json")
             else:
-                res = gl.nondet.exec_prompt(prompt, response_format="json")
+                res = gl.nondet.exec_prompt(final_prompt, response_format="json")
 
             return json.dumps(
                 {
